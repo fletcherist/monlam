@@ -1,0 +1,11 @@
+[package]
+name = "fun"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+dsp = { path = "../dsp" }
+hound = "3.4.0"
+rustfft = "6.1.0"
+num-complex = "0.4.3"
+cmaes = "0.2.2"
