@@ -21,6 +21,7 @@ struct Track {
     duration: f32,
     current_position: f32,
     waveform_samples: Vec<f32>,
+    sample_rate: u32,
 }
 
 impl Track {
@@ -29,9 +30,20 @@ impl Track {
             if let Ok(file) = File::open(path) {
                 let reader = BufReader::new(file);
                 if let Ok(decoder) = Decoder::new(reader) {
+                    let source =
+                        decoder.skip_duration(std::time::Duration::from_secs_f32(position));
+
+                    if let Some(sink) = &self.sink {
+                        sink.stop();
+                    }
+
                     if let Ok(sink) = Sink::try_new(stream_handle) {
-                        sink.append(decoder);
-                        sink.pause();
+                        sink.append(source);
+                        if self.is_playing {
+                            sink.play();
+                        } else {
+                            sink.pause();
+                        }
                         self.sink = Some(sink);
                         self.current_position = position;
                     }
@@ -44,15 +56,19 @@ impl Track {
         if let Some(path) = &self.audio_file {
             if let Ok(file) = File::open(path) {
                 let reader = BufReader::new(file);
-                if let Ok(decoder) = Decoder::new(reader) {
+
+                // First pass: get samples and duration
+                if let Ok(decoder_for_waveform) = Decoder::new(reader) {
+                    // Store sample rate for accurate seeking
+                    self.sample_rate = decoder_for_waveform.sample_rate();
                     // Get duration from decoder
-                    self.duration = decoder
+                    self.duration = decoder_for_waveform
                         .total_duration()
                         .map(|d| d.as_secs_f32())
                         .unwrap_or(0.0);
 
                     // Convert audio to mono samples
-                    let samples: Vec<f32> = decoder.convert_samples::<f32>().collect();
+                    let samples: Vec<f32> = decoder_for_waveform.convert_samples::<f32>().collect();
 
                     // Downsample to 1000 points for visualization
                     let downsample_factor = samples.len() / 1000;
@@ -62,10 +78,22 @@ impl Track {
                             chunk.iter().map(|&x| x.abs()).sum::<f32>() / chunk.len() as f32
                         })
                         .collect();
+                }
 
-                    // Initialize sink for playback
-                    if let Ok(sink) = Sink::try_new(&OutputStream::try_default().unwrap().1) {
-                        self.sink = Some(sink);
+                // Second pass: create audio source
+                if let Ok((_stream, stream_handle)) = OutputStream::try_default() {
+                    let file = File::open(path).unwrap();
+                    let reader = BufReader::new(file);
+                    if let Ok(decoder_for_playback) = Decoder::new(reader) {
+                        let source = decoder_for_playback
+                            .skip_duration(std::time::Duration::from_secs_f32(0.0));
+
+                        if let Ok(sink) = Sink::try_new(&stream_handle) {
+                            sink.append(source);
+                            sink.pause(); // Start paused
+                            self.sink = Some(sink);
+                            self.current_position = 0.0;
+                        }
                     }
                 }
             }
@@ -141,17 +169,16 @@ impl eframe::App for DawApp {
             }
         }
 
-        // Update timeline position based on playback
+        // Update timeline position based on audio playback
         if self.is_playing {
             let now = std::time::Instant::now();
             let delta = now.duration_since(self.last_update).as_secs_f32();
             self.timeline_position += delta;
-            self.last_update = now;
 
-            // Update track positions
             for track in &mut self.tracks {
                 if track.is_playing {
                     track.current_position += delta;
+
                     if track.current_position >= track.duration {
                         track.current_position = 0.0;
                         if let Some(sink) = &track.sink {
@@ -161,6 +188,7 @@ impl eframe::App for DawApp {
                     }
                 }
             }
+            self.last_update = now;
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
