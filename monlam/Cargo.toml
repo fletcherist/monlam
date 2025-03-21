@@ -12,3 +12,5 @@ symphonia = { version = "0.5", features = ["mp3", "wav", "ogg", "flac", "isomp4"
 cpal = "0.15.2"  # low-level audio I/O
 num-traits = "0.2.19"
 rodio = "0.17.3"  # high-level audio playback
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0" 

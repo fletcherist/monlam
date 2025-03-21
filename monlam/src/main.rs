@@ -2,21 +2,26 @@ use eframe::egui;
 use egui::{Color32, Key, RichText, Stroke};
 use rfd::FileDialog;
 use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink, Source};
+use serde::{Deserialize, Serialize};
+use std::env;
+use std::fs;
 use std::fs::File;
 use std::io::BufReader;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const BUFFER_SIZE: usize = 1024;
 const SAMPLE_RATE: u32 = 44100;
 
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
 struct Track {
     name: String,
     audio_file: Option<PathBuf>,
     muted: bool,
     soloed: bool,
     recording: bool,
+    #[serde(skip)]
     sink: Option<Sink>,
+    #[serde(skip)]
     is_playing: bool,
     duration: f32,
     current_position: f32,
@@ -101,35 +106,122 @@ impl Track {
     }
 }
 
-struct DawApp {
+#[derive(Serialize, Deserialize)]
+struct DawState {
     timeline_position: f32,
+    #[serde(skip)]
     is_playing: bool,
     bpm: f32,
     tracks: Vec<Track>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct Config {
+    latest_project: Option<PathBuf>,
+}
+
+struct DawApp {
+    state: DawState,
     _stream: OutputStream,
     stream_handle: OutputStreamHandle,
     last_update: std::time::Instant,
     seek_position: Option<f32>,
 }
 
+impl DawApp {
+    fn get_config_path() -> PathBuf {
+        let home = env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        Path::new(&home).join(".monlam").join("config.json")
+    }
+
+    fn save_config(project_path: Option<PathBuf>) {
+        let config = Config {
+            latest_project: project_path,
+        };
+        if let Ok(serialized) = serde_json::to_string_pretty(&config) {
+            let config_path = Self::get_config_path();
+            if let Some(parent) = config_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = fs::write(config_path, serialized);
+        }
+    }
+
+    fn load_config() -> Option<PathBuf> {
+        let config_path = Self::get_config_path();
+        if let Ok(contents) = fs::read_to_string(config_path) {
+            if let Ok(config) = serde_json::from_str::<Config>(&contents) {
+                return config.latest_project;
+            }
+        }
+        None
+    }
+
+    fn save_project(&self) {
+        if let Some(path) = FileDialog::new()
+            .add_filter("DAW Project", &["json"])
+            .save_file()
+        {
+            if let Ok(serialized) = serde_json::to_string_pretty(&self.state) {
+                if fs::write(&path, serialized).is_ok() {
+                    Self::save_config(Some(path));
+                }
+            }
+        }
+    }
+
+    fn load_project(&mut self) {
+        if let Some(path) = FileDialog::new()
+            .add_filter("DAW Project", &["json"])
+            .pick_file()
+        {
+            self.load_project_from_path(path.clone());
+            Self::save_config(Some(path));
+        }
+    }
+
+    fn load_project_from_path(&mut self, path: PathBuf) {
+        if let Ok(contents) = fs::read_to_string(&path) {
+            if let Ok(mut loaded_state) = serde_json::from_str::<DawState>(&contents) {
+                // Reload audio files and recreate sinks
+                for track in &mut loaded_state.tracks {
+                    if let Some(_path) = &track.audio_file {
+                        track.load_waveform();
+                    }
+                }
+                self.state = loaded_state;
+            }
+        }
+    }
+}
+
 impl Default for DawApp {
     fn default() -> Self {
         let (_stream, stream_handle) = OutputStream::try_default().unwrap();
-        Self {
-            timeline_position: 0.0,
-            is_playing: false,
-            bpm: 120.0,
-            tracks: (1..=4)
-                .map(|i| Track {
-                    name: format!("Track {}", i),
-                    ..Default::default()
-                })
-                .collect(),
+        let mut app = Self {
+            state: DawState {
+                timeline_position: 0.0,
+                is_playing: false,
+                bpm: 120.0,
+                tracks: (1..=4)
+                    .map(|i| Track {
+                        name: format!("Track {}", i),
+                        ..Default::default()
+                    })
+                    .collect(),
+            },
             _stream,
             stream_handle,
             last_update: std::time::Instant::now(),
             seek_position: None,
+        };
+
+        // Try to load the latest project if available
+        if let Some(path) = Self::load_config() {
+            app.load_project_from_path(path);
         }
+
+        app
     }
 }
 
@@ -140,10 +232,10 @@ impl eframe::App for DawApp {
 
         // Handle seek position if set
         if let Some(click_position) = self.seek_position.take() {
-            self.timeline_position = click_position;
-            for track in &mut self.tracks {
+            self.state.timeline_position = click_position;
+            for track in &mut self.state.tracks {
                 track.seek_to(click_position, &self.stream_handle);
-                if self.is_playing {
+                if self.state.is_playing {
                     if let Some(sink) = &track.sink {
                         sink.play();
                     }
@@ -154,28 +246,28 @@ impl eframe::App for DawApp {
 
         // Handle spacebar input
         if ctx.input(|i| i.key_pressed(Key::Space)) {
-            self.is_playing = !self.is_playing;
+            self.state.is_playing = !self.state.is_playing;
             self.last_update = std::time::Instant::now();
 
-            for track in &mut self.tracks {
+            for track in &mut self.state.tracks {
                 if let Some(sink) = &track.sink {
-                    if self.is_playing {
+                    if self.state.is_playing {
                         sink.play();
                     } else {
                         sink.pause();
                     }
                 }
-                track.is_playing = self.is_playing;
+                track.is_playing = self.state.is_playing;
             }
         }
 
         // Update timeline position based on audio playback
-        if self.is_playing {
+        if self.state.is_playing {
             let now = std::time::Instant::now();
             let delta = now.duration_since(self.last_update).as_secs_f32();
-            self.timeline_position += delta;
+            self.state.timeline_position += delta;
 
-            for track in &mut self.tracks {
+            for track in &mut self.state.tracks {
                 if track.is_playing {
                     track.current_position += delta;
 
@@ -197,29 +289,32 @@ impl eframe::App for DawApp {
                 // Transport controls
                 ui.horizontal(|ui| {
                     if ui.button("⏮").clicked() {
-                        self.timeline_position = 0.0;
+                        self.state.timeline_position = 0.0;
                         // Stop all tracks and reset positions
-                        for track in &mut self.tracks {
+                        for track in &mut self.state.tracks {
                             track.is_playing = false;
                             track.current_position = 0.0;
                             track.seek_to(0.0, &self.stream_handle);
                         }
                     }
-                    if ui.button(if self.is_playing { "⏸" } else { "▶" }).clicked() {
-                        self.is_playing = !self.is_playing;
+                    if ui
+                        .button(if self.state.is_playing { "⏸" } else { "▶" })
+                        .clicked()
+                    {
+                        self.state.is_playing = !self.state.is_playing;
                         self.last_update = std::time::Instant::now();
                         // Toggle playback for all tracks
-                        for track in &mut self.tracks {
-                            track.is_playing = self.is_playing;
+                        for track in &mut self.state.tracks {
+                            track.is_playing = self.state.is_playing;
                         }
                     }
                     if ui.button("⏭").clicked() {
-                        self.timeline_position += 4.0;
+                        self.state.timeline_position += 4.0;
                         // Stop all tracks and seek to new position
-                        for track in &mut self.tracks {
+                        for track in &mut self.state.tracks {
                             track.is_playing = false;
-                            track.current_position = self.timeline_position;
-                            track.seek_to(self.timeline_position, &self.stream_handle);
+                            track.current_position = self.state.timeline_position;
+                            track.seek_to(self.state.timeline_position, &self.stream_handle);
                         }
                     }
                 });
@@ -227,10 +322,18 @@ impl eframe::App for DawApp {
                 // BPM control
                 ui.label("BPM:");
                 ui.add(
-                    egui::DragValue::new(&mut self.bpm)
+                    egui::DragValue::new(&mut self.state.bpm)
                         .speed(1.0)
                         .clamp_range(20.0..=240.0),
                 );
+
+                // Save/load buttons
+                if ui.button("💾 Save").clicked() {
+                    self.save_project();
+                }
+                if ui.button("📂 Open").clicked() {
+                    self.load_project();
+                }
             });
 
             ui.separator();
@@ -238,16 +341,18 @@ impl eframe::App for DawApp {
             // Timeline
             ui.horizontal(|ui| {
                 ui.label("Timeline:");
-                let timeline_response =
-                    ui.add(egui::Slider::new(&mut self.timeline_position, 0.0..=100.0));
-                ui.label(format!("{:.1}s", self.timeline_position));
+                let timeline_response = ui.add(egui::Slider::new(
+                    &mut self.state.timeline_position,
+                    0.0..=100.0,
+                ));
+                ui.label(format!("{:.1}s", self.state.timeline_position));
 
                 // If timeline was dragged, update track positions
                 if timeline_response.changed() {
-                    for track in &mut self.tracks {
+                    for track in &mut self.state.tracks {
                         track.is_playing = false;
-                        track.current_position = self.timeline_position;
-                        track.seek_to(self.timeline_position, &self.stream_handle);
+                        track.current_position = self.state.timeline_position;
+                        track.seek_to(self.state.timeline_position, &self.stream_handle);
                     }
                 }
             });
@@ -257,7 +362,7 @@ impl eframe::App for DawApp {
             // Track list
             ui.label(RichText::new("Tracks").color(Color32::WHITE));
 
-            for (_index, track) in self.tracks.iter_mut().enumerate() {
+            for (_index, track) in self.state.tracks.iter_mut().enumerate() {
                 ui.horizontal(|ui| {
                     // Track name with color based on whether it has an audio file
                     ui.label(
