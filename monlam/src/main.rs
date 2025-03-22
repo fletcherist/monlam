@@ -36,6 +36,10 @@ struct Track {
     waveform_samples: Vec<f32>,
     sample_rate: u32,
     is_playing: bool,
+    grid_position: f32,   // Position in the grid (in beats)
+    grid_length: f32,     // Length in the grid (in beats)
+    grid_start_time: f32, // When this track should start playing (in seconds)
+    grid_end_time: f32,   // When this track should stop playing (in seconds)
 }
 
 impl Default for Track {
@@ -54,6 +58,10 @@ impl Default for Track {
             waveform_samples: Vec::new(),
             sample_rate: SAMPLE_RATE,
             is_playing: false,
+            grid_position: 0.0,
+            grid_length: 4.0, // Default to 4 beats
+            grid_start_time: 0.0,
+            grid_end_time: 4.0 * (60.0 / 120.0), // Default to 4 beats at 120 BPM
         }
     }
 }
@@ -110,9 +118,14 @@ impl Track {
             None,
         ) {
             Ok(stream) => {
+                // Ensure stream is paused when created
+                if let Err(e) = stream.pause() {
+                    eprintln!("Failed to pause new stream: {}", e);
+                }
                 self.stream = Some(stream);
                 self.sample_index = sample_index;
-                eprintln!("Created new audio stream");
+                self.is_playing = false; // Ensure track is marked as not playing
+                eprintln!("Created new audio stream (paused)");
             }
             Err(e) => {
                 eprintln!("Failed to create audio stream: {}", e);
@@ -183,15 +196,22 @@ impl Track {
     fn current_position(&self) -> f32 {
         self.sample_index.load(Ordering::Relaxed) as f32 / self.sample_rate as f32
     }
+
+    fn update_grid_times(&mut self, bpm: f32) {
+        // Convert beats to seconds
+        self.grid_start_time = self.grid_position * (60.0 / bpm);
+        self.grid_end_time = (self.grid_position + self.grid_length) * (60.0 / bpm);
+    }
 }
 
 #[derive(Serialize, Deserialize)]
 struct DawState {
     timeline_position: f32,
-    #[serde(skip)]
     is_playing: bool,
     bpm: f32,
     tracks: Vec<Track>,
+    grid_snap: bool,    // Whether to snap to grid
+    grid_division: f32, // Grid division in beats (e.g., 0.25 for 16th notes)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -269,8 +289,13 @@ impl DawApp {
                         eprintln!("Loading audio file: {}", path.display());
                         track.load_waveform();
                         track.create_stream(&self.output_device, &self.output_config);
+                        // Ensure track is not playing when loaded
+                        track.is_playing = false;
+                        track.current_position = 0.0;
                     }
                 }
+                // Ensure playback is stopped when loading
+                loaded_state.is_playing = false;
                 self.state = loaded_state;
                 eprintln!("Project loaded successfully");
             } else {
@@ -294,9 +319,13 @@ impl DawApp {
                 tracks: (1..=4)
                     .map(|i| Track {
                         name: format!("Track {}", i),
+                        is_playing: false,
+                        current_position: 0.0,
                         ..Default::default()
                     })
                     .collect(),
+                grid_snap: true,
+                grid_division: 0.25, // 16th notes by default
             },
             last_update: std::time::Instant::now(),
             seek_position: None,
@@ -310,17 +339,44 @@ impl DawApp {
             app.load_project_from_path(path);
         }
 
+        // Ensure all tracks are not playing after loading
+        for track in &mut app.state.tracks {
+            track.is_playing = false;
+            track.current_position = 0.0;
+        }
+
         app
     }
 
     fn update_playback(&mut self) {
         if self.state.is_playing {
             for track in &mut self.state.tracks {
-                track.play();
+                // Update grid times based on current BPM
+                track.update_grid_times(self.state.bpm);
+
+                // Check if current timeline position is within track's grid time
+                if self.state.timeline_position >= track.grid_start_time
+                    && self.state.timeline_position < track.grid_end_time
+                {
+                    if !track.is_playing {
+                        // Calculate relative position within the track
+                        let relative_position =
+                            self.state.timeline_position - track.grid_start_time;
+                        track.seek_to(relative_position);
+                        track.play();
+                    }
+                } else {
+                    if track.is_playing {
+                        track.pause();
+                    }
+                    track.current_position = 0.0;
+                }
             }
         } else {
+            // When stopping playback, pause all tracks
             for track in &mut self.state.tracks {
                 track.pause();
+                track.current_position = 0.0;
             }
         }
     }
@@ -335,8 +391,17 @@ impl eframe::App for DawApp {
         if let Some(click_position) = self.seek_position.take() {
             self.state.timeline_position = click_position;
             for track in &mut self.state.tracks {
-                track.seek_to(click_position);
-                track.play();
+                // Update grid times based on current BPM
+                track.update_grid_times(self.state.bpm);
+
+                // Check if seek position is within track's grid time
+                if click_position >= track.grid_start_time && click_position < track.grid_end_time {
+                    // Calculate relative position within the track
+                    let relative_position = click_position - track.grid_start_time;
+                    track.seek_to(relative_position);
+                } else {
+                    track.seek_to(0.0);
+                }
             }
         }
 
@@ -354,13 +419,27 @@ impl eframe::App for DawApp {
             self.state.timeline_position += delta;
 
             for track in &mut self.state.tracks {
-                if track.is_playing {
-                    track.current_position += delta;
+                // Update grid times based on current BPM
+                track.update_grid_times(self.state.bpm);
 
-                    if track.current_position >= track.duration {
-                        track.current_position = 0.0;
+                // Check if current position is within track's grid time
+                if self.state.timeline_position >= track.grid_start_time
+                    && self.state.timeline_position < track.grid_end_time
+                {
+                    if track.is_playing {
+                        track.current_position += delta;
+
+                        // Stop track if it reaches its grid end time
+                        if track.current_position >= (track.grid_length * (60.0 / self.state.bpm)) {
+                            track.current_position = 0.0;
+                            track.pause();
+                        }
+                    }
+                } else {
+                    if track.is_playing {
                         track.pause();
                     }
+                    track.current_position = 0.0;
                 }
             }
             self.last_update = now;
@@ -407,6 +486,15 @@ impl eframe::App for DawApp {
                         .clamp_range(20.0..=240.0),
                 );
 
+                // Grid controls
+                ui.checkbox(&mut self.state.grid_snap, "Grid Snap");
+                ui.label("Grid:");
+                ui.add(
+                    egui::DragValue::new(&mut self.state.grid_division)
+                        .speed(0.25)
+                        .clamp_range(0.25..=4.0),
+                );
+
                 // Save/load buttons
                 if ui.button("💾 Save").clicked() {
                     self.save_project();
@@ -418,30 +506,189 @@ impl eframe::App for DawApp {
 
             ui.separator();
 
-            // Timeline
-            ui.horizontal(|ui| {
-                ui.label("Timeline:");
-                let timeline_response = ui.add(egui::Slider::new(
-                    &mut self.state.timeline_position,
-                    0.0..=100.0,
-                ));
-                ui.label(format!("{:.1}s", self.state.timeline_position));
+            // Timeline and grid
+            let timeline_height = 100.0;
+            let (timeline_response, painter) = ui.allocate_painter(
+                egui::vec2(ui.available_width(), timeline_height),
+                egui::Sense::click_and_drag(),
+            );
 
-                // If timeline was dragged, update track positions
-                if timeline_response.changed() {
-                    for track in &mut self.state.tracks {
-                        track.is_playing = false;
-                        track.current_position = self.state.timeline_position;
-                        track.seek_to(self.state.timeline_position);
+            if timeline_response.rect.width() > 0.0 {
+                let rect = timeline_response.rect;
+                let width = rect.width();
+                let height = rect.height();
+
+                // Draw grid lines
+                let beats_per_bar = 4.0;
+                let total_bars = 8.0;
+                let total_beats = total_bars * beats_per_bar;
+                let pixels_per_beat = width / total_beats;
+
+                // Draw bar lines
+                for bar in 0..=total_bars as i32 {
+                    let x = rect.left() + (bar as f32 * beats_per_bar * pixels_per_beat);
+                    painter.line_segment(
+                        [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+                        Stroke::new(2.0, Color32::from_rgb(100, 100, 100)),
+                    );
+                }
+
+                // Draw beat lines
+                for beat in 0..=(total_beats * self.state.grid_division) as i32 {
+                    let x =
+                        rect.left() + (beat as f32 * pixels_per_beat / self.state.grid_division);
+                    painter.line_segment(
+                        [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+                        Stroke::new(1.0, Color32::from_rgb(50, 50, 50)),
+                    );
+                }
+
+                // Draw playhead
+                let playhead_x = rect.left() + (self.state.timeline_position * pixels_per_beat);
+                painter.line_segment(
+                    [
+                        egui::pos2(playhead_x, rect.top()),
+                        egui::pos2(playhead_x, rect.bottom()),
+                    ],
+                    Stroke::new(2.0, Color32::RED),
+                );
+
+                // Draw time markers
+                for bar in 0..=total_bars as i32 {
+                    let x = rect.left() + (bar as f32 * beats_per_bar * pixels_per_beat);
+                    let time = (bar as f32 * beats_per_bar * 60.0) / self.state.bpm;
+                    let time_text = format!("{:.1}s", time);
+                    painter.text(
+                        egui::pos2(x + 2.0, rect.top() + 15.0),
+                        egui::Align2::LEFT_TOP,
+                        time_text,
+                        egui::FontId::proportional(12.0),
+                        Color32::WHITE,
+                    );
+                }
+
+                // Handle timeline interaction
+                if timeline_response.dragged() || timeline_response.clicked() {
+                    if let Some(pos) = timeline_response.interact_pointer_pos() {
+                        let click_x = pos.x - rect.left();
+                        // Convert click position to beats
+                        let click_beats = click_x / pixels_per_beat;
+                        if self.state.grid_snap {
+                            let snapped_beats = (click_beats / self.state.grid_division).round()
+                                * self.state.grid_division;
+                            self.state.timeline_position = snapped_beats;
+                        } else {
+                            self.state.timeline_position = click_beats;
+                        }
+                        for track in &mut self.state.tracks {
+                            track.seek_to(self.state.timeline_position * (60.0 / self.state.bpm));
+                        }
                     }
                 }
-            });
+            }
 
             ui.separator();
 
-            // Track list
+            // Track list with grid positions
             ui.label(RichText::new("Tracks").color(Color32::WHITE));
 
+            // Create a grid view for tracks
+            let track_height = 80.0;
+            let track_spacing = 10.0;
+            let total_height =
+                (self.state.tracks.len() as f32 * (track_height + track_spacing)) + track_spacing;
+
+            let (track_area_response, track_painter) = ui.allocate_painter(
+                egui::vec2(ui.available_width(), total_height),
+                egui::Sense::click_and_drag(),
+            );
+
+            if track_area_response.rect.width() > 0.0 {
+                let rect = track_area_response.rect;
+                let width = rect.width();
+                let beats_per_bar = 4.0;
+                let total_bars = 8.0;
+                let total_beats = total_bars * beats_per_bar;
+                let pixels_per_beat = width / total_beats;
+
+                // Draw tracks in grid
+                for (index, track) in self.state.tracks.iter_mut().enumerate() {
+                    let track_y = rect.top()
+                        + track_spacing
+                        + (index as f32 * (track_height + track_spacing));
+
+                    // Calculate track position in grid
+                    let track_x = rect.left() + (track.grid_position * pixels_per_beat);
+                    let track_width = track.grid_length * pixels_per_beat;
+
+                    // Draw track background
+                    let track_rect = egui::Rect::from_min_size(
+                        egui::pos2(track_x, track_y),
+                        egui::vec2(track_width, track_height),
+                    );
+
+                    // Draw track background with color based on state
+                    let bg_color = if track.muted {
+                        Color32::from_rgb(50, 50, 50)
+                    } else if track.soloed {
+                        Color32::from_rgb(50, 50, 100)
+                    } else {
+                        Color32::from_rgb(30, 30, 30)
+                    };
+                    track_painter.rect_filled(track_rect, 5.0, bg_color);
+
+                    // Draw track name
+                    track_painter.text(
+                        egui::pos2(track_x + 5.0, track_y + 20.0),
+                        egui::Align2::LEFT_TOP,
+                        &track.name,
+                        egui::FontId::proportional(14.0),
+                        Color32::WHITE,
+                    );
+
+                    // Draw waveform if available
+                    if !track.waveform_samples.is_empty() {
+                        let waveform_height = track_height - 40.0;
+                        let waveform_y = track_y + 30.0;
+                        let waveform_width = track_width - 10.0;
+                        let waveform_x = track_x + 5.0;
+
+                        // Draw waveform
+                        for (i, &sample) in track.waveform_samples.iter().enumerate() {
+                            let x = waveform_x
+                                + (i as f32 / track.waveform_samples.len() as f32) * waveform_width;
+                            let amplitude = sample * waveform_height * 0.5;
+                            track_painter.line_segment(
+                                [
+                                    egui::pos2(x, waveform_y + waveform_height / 2.0 - amplitude),
+                                    egui::pos2(x, waveform_y + waveform_height / 2.0 + amplitude),
+                                ],
+                                Stroke::new(1.0, Color32::from_rgb(100, 100, 100)),
+                            );
+                        }
+                    }
+
+                    // Handle track dragging
+                    if track_area_response.dragged() {
+                        if let Some(pos) = track_area_response.interact_pointer_pos() {
+                            if track_rect.contains(pos) {
+                                let click_x = pos.x - rect.left();
+                                let grid_position =
+                                    (click_x / pixels_per_beat) * (60.0 / self.state.bpm);
+                                if self.state.grid_snap {
+                                    track.grid_position =
+                                        (grid_position / self.state.grid_division).round()
+                                            * self.state.grid_division;
+                                } else {
+                                    track.grid_position = grid_position;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Track controls
             for (_index, track) in self.state.tracks.iter_mut().enumerate() {
                 ui.horizontal(|ui| {
                     // Track name with color based on whether it has an audio file
@@ -452,6 +699,39 @@ impl eframe::App for DawApp {
                             Color32::WHITE
                         }),
                     );
+
+                    // Start and End time controls in seconds
+                    ui.label("Start:");
+                    let mut start_time = track.grid_position * (60.0 / self.state.bpm);
+                    if ui
+                        .add(egui::DragValue::new(&mut start_time).speed(0.1))
+                        .changed()
+                    {
+                        let new_grid_pos = start_time / (60.0 / self.state.bpm);
+                        if self.state.grid_snap {
+                            track.grid_position = (new_grid_pos / self.state.grid_division).round()
+                                * self.state.grid_division;
+                        } else {
+                            track.grid_position = new_grid_pos;
+                        }
+                    }
+
+                    ui.label("End:");
+                    let mut end_time =
+                        (track.grid_position + track.grid_length) * (60.0 / self.state.bpm);
+                    if ui
+                        .add(egui::DragValue::new(&mut end_time).speed(0.1))
+                        .changed()
+                    {
+                        let new_grid_len =
+                            (end_time / (60.0 / self.state.bpm)) - track.grid_position;
+                        if self.state.grid_snap {
+                            track.grid_length = (new_grid_len / self.state.grid_division).round()
+                                * self.state.grid_division;
+                        } else {
+                            track.grid_length = new_grid_len;
+                        }
+                    }
 
                     // File selector button
                     if ui.button("📂").clicked() {
@@ -501,68 +781,6 @@ impl eframe::App for DawApp {
                         track.recording = !track.recording;
                     }
                 });
-
-                // Draw waveform if available
-                if !track.waveform_samples.is_empty() {
-                    let (response, painter) = ui.allocate_painter(
-                        egui::vec2(ui.available_width(), 50.0),
-                        egui::Sense::click(),
-                    );
-
-                    if response.rect.width() > 0.0 {
-                        let rect = response.rect;
-                        let width = rect.width();
-                        let height = rect.height();
-                        let center_y = rect.center().y;
-
-                        // Draw waveform
-                        for (i, &sample) in track.waveform_samples.iter().enumerate() {
-                            let x = rect.left()
-                                + (i as f32 / track.waveform_samples.len() as f32) * width;
-                            let amplitude = sample * height * 0.5;
-                            painter.line_segment(
-                                [
-                                    egui::pos2(x, center_y - amplitude),
-                                    egui::pos2(x, center_y + amplitude),
-                                ],
-                                Stroke::new(1.0, Color32::from_rgb(100, 100, 100)),
-                            );
-                        }
-
-                        // Draw playhead
-                        let playhead_x =
-                            rect.left() + (track.current_position / track.duration) * width;
-                        painter.line_segment(
-                            [
-                                egui::pos2(playhead_x, rect.top()),
-                                egui::pos2(playhead_x, rect.bottom()),
-                            ],
-                            Stroke::new(2.0, Color32::RED),
-                        );
-
-                        // Handle click to seek
-                        if response.clicked() {
-                            if let Some(pos) = response.interact_pointer_pos() {
-                                let click_x = pos.x - rect.left();
-                                let click_position = (click_x / width) * track.duration;
-                                self.seek_position = Some(click_position);
-                            }
-                        }
-                    }
-                }
-
-                // Show file info on hover
-                if track.audio_file.is_some() {
-                    ui.small(format!(
-                        "File: {}",
-                        track
-                            .audio_file
-                            .as_ref()
-                            .and_then(|p| p.file_name())
-                            .and_then(|n| n.to_str())
-                            .unwrap_or("Unknown")
-                    ));
-                }
             }
         });
     }
