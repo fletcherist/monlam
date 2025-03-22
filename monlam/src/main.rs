@@ -1,18 +1,24 @@
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use eframe::egui;
 use egui::{Color32, Key, RichText, Stroke};
 use rfd::FileDialog;
-use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink, Source};
+use ringbuf::HeapRb;
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs;
 use std::fs::File;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use symphonia::core::audio::AudioBufferRef;
+use symphonia::core::io::MediaSourceStream;
+use symphonia::core::probe::Hint;
 
 const BUFFER_SIZE: usize = 1024;
 const SAMPLE_RATE: u32 = 44100;
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct Track {
     name: String,
     audio_file: Option<PathBuf>,
@@ -20,89 +26,162 @@ struct Track {
     soloed: bool,
     recording: bool,
     #[serde(skip)]
-    sink: Option<Sink>,
+    stream: Option<cpal::Stream>,
     #[serde(skip)]
-    is_playing: bool,
+    sample_index: Arc<AtomicUsize>,
+    #[serde(skip)]
+    audio_buffer: Arc<Mutex<Vec<f32>>>,
     duration: f32,
     current_position: f32,
     waveform_samples: Vec<f32>,
     sample_rate: u32,
+    is_playing: bool,
+}
+
+impl Default for Track {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            audio_file: None,
+            muted: false,
+            soloed: false,
+            recording: false,
+            stream: None,
+            sample_index: Arc::new(AtomicUsize::new(0)),
+            audio_buffer: Arc::new(Mutex::new(vec![0.0; 1024 * 1024])),
+            duration: 0.0,
+            current_position: 0.0,
+            waveform_samples: Vec::new(),
+            sample_rate: SAMPLE_RATE,
+            is_playing: false,
+        }
+    }
 }
 
 impl Track {
-    fn seek_to(&mut self, position: f32, stream_handle: &OutputStreamHandle) {
-        if let Some(path) = &self.audio_file {
-            if let Ok(file) = File::open(path) {
-                let reader = BufReader::new(file);
-                if let Ok(decoder) = Decoder::new(reader) {
-                    let source =
-                        decoder.skip_duration(std::time::Duration::from_secs_f32(position));
+    fn create_stream(&mut self, device: &cpal::Device, config: &cpal::StreamConfig) {
+        // Only create stream if we have an audio file
+        if self.audio_file.is_none() {
+            eprintln!("Cannot create stream: No audio file loaded");
+            return;
+        }
 
-                    if let Some(sink) = &self.sink {
-                        sink.stop();
-                    }
-
-                    if let Ok(sink) = Sink::try_new(stream_handle) {
-                        sink.append(source);
-                        if self.is_playing {
-                            sink.play();
-                        } else {
-                            sink.pause();
-                        }
-                        self.sink = Some(sink);
-                        self.current_position = position;
-                    }
-                }
+        // Stop and drop existing stream if any
+        if self.stream.is_some() {
+            if let Err(e) = self.stream.as_ref().unwrap().pause() {
+                eprintln!("Failed to pause existing stream: {}", e);
             }
+            self.stream = None;
+            self.is_playing = false;
+        }
+
+        // Initialize audio buffer if it doesn't exist
+        if self.audio_buffer.lock().is_err() {
+            self.audio_buffer = Arc::new(Mutex::new(vec![0.0; 1024 * 1024]));
+        }
+
+        let audio_buffer = Arc::clone(&self.audio_buffer);
+        let sample_index = Arc::new(AtomicUsize::new(0));
+        let num_channels = config.channels as usize;
+
+        match device.build_output_stream(
+            config,
+            {
+                let audio_buffer = Arc::clone(&audio_buffer);
+                let sample_index = Arc::clone(&sample_index);
+                let num_channels = num_channels;
+                move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                    let mut index = sample_index.load(Ordering::Relaxed);
+
+                    for frame in data.chunks_mut(num_channels) {
+                        for (channel, sample) in frame.iter_mut().enumerate() {
+                            let sample_idx = index * num_channels + channel;
+                            if let Ok(buffer) = audio_buffer.lock() {
+                                *sample = buffer.get(sample_idx).copied().unwrap_or(0.0);
+                            }
+                        }
+                        index += 1;
+                    }
+
+                    sample_index.store(index, Ordering::Relaxed);
+                }
+            },
+            |err| eprintln!("Stream error: {}", err),
+            None,
+        ) {
+            Ok(stream) => {
+                self.stream = Some(stream);
+                self.sample_index = sample_index;
+                eprintln!("Created new audio stream");
+            }
+            Err(e) => {
+                eprintln!("Failed to create audio stream: {}", e);
+            }
+        }
+    }
+
+    fn seek_to(&mut self, position: f32) {
+        let mut index = self.sample_index.load(Ordering::Relaxed);
+        index = (position * self.sample_rate as f32) as usize;
+        self.sample_index.store(index, Ordering::Relaxed);
+    }
+
+    fn play(&mut self) {
+        if let Some(stream) = &self.stream {
+            if let Err(e) = stream.play() {
+                eprintln!("Failed to play stream: {}", e);
+                return;
+            }
+            self.is_playing = true;
+            eprintln!("Started playing audio");
+        } else {
+            eprintln!("No audio stream available");
+        }
+    }
+
+    fn pause(&mut self) {
+        if let Some(stream) = &self.stream {
+            if let Err(e) = stream.pause() {
+                eprintln!("Failed to pause stream: {}", e);
+                return;
+            }
+            self.is_playing = false;
+            eprintln!("Paused audio");
         }
     }
 
     fn load_waveform(&mut self) {
         if let Some(path) = &self.audio_file {
-            if let Ok(file) = File::open(path) {
-                let reader = BufReader::new(file);
+            let path = path.clone();
+            let (samples, sample_rate) = load_audio(&path);
+            self.sample_rate = sample_rate;
+            self.duration = samples.len() as f32 / sample_rate as f32;
 
-                // First pass: get samples and duration
-                if let Ok(decoder_for_waveform) = Decoder::new(reader) {
-                    // Store sample rate for accurate seeking
-                    self.sample_rate = decoder_for_waveform.sample_rate();
-                    // Get duration from decoder
-                    self.duration = decoder_for_waveform
-                        .total_duration()
-                        .map(|d| d.as_secs_f32())
-                        .unwrap_or(0.0);
+            // Downsample waveform for display
+            let downsample_factor = samples.len() / 1000; // Show 1000 points
+            self.waveform_samples = samples
+                .chunks(downsample_factor)
+                .map(|chunk| chunk.iter().sum::<f32>() / chunk.len() as f32)
+                .collect();
 
-                    // Convert audio to mono samples
-                    let samples: Vec<f32> = decoder_for_waveform.convert_samples::<f32>().collect();
+            // Initialize audio buffer if it doesn't exist
+            if self.audio_buffer.lock().is_err() {
+                self.audio_buffer = Arc::new(Mutex::new(vec![0.0; 1024 * 1024]));
+            }
 
-                    // Downsample to 1000 points for visualization
-                    let downsample_factor = samples.len() / 1000;
-                    self.waveform_samples = samples
-                        .chunks(downsample_factor)
-                        .map(|chunk| {
-                            chunk.iter().map(|&x| x.abs()).sum::<f32>() / chunk.len() as f32
-                        })
-                        .collect();
-                }
-
-                // Second pass: create audio source
-                if let Ok((_stream, stream_handle)) = OutputStream::try_default() {
-                    let file = File::open(path).unwrap();
-                    let reader = BufReader::new(file);
-                    if let Ok(decoder_for_playback) = Decoder::new(reader) {
-                        let source = decoder_for_playback
-                            .skip_duration(std::time::Duration::from_secs_f32(0.0));
-
-                        if let Ok(sink) = Sink::try_new(&stream_handle) {
-                            sink.append(source);
-                            sink.pause(); // Start paused
-                            self.sink = Some(sink);
-                            self.current_position = 0.0;
-                        }
-                    }
-                }
+            // Fill audio buffer with audio data
+            if let Ok(mut buffer) = self.audio_buffer.lock() {
+                buffer.clear();
+                buffer.extend_from_slice(&samples);
+                eprintln!("Loaded {} samples into audio buffer", samples.len());
+            } else {
+                eprintln!("Failed to lock audio buffer for writing");
             }
         }
+    }
+
+    fn current_position(&self) -> f32 {
+        self.sample_index.load(Ordering::Relaxed) as f32 / self.sample_rate as f32
     }
 }
 
@@ -122,10 +201,11 @@ struct Config {
 
 struct DawApp {
     state: DawState,
-    _stream: OutputStream,
-    stream_handle: OutputStreamHandle,
     last_update: std::time::Instant,
     seek_position: Option<f32>,
+    host: cpal::Host,
+    output_device: cpal::Device,
+    output_config: cpal::StreamConfig,
 }
 
 impl DawApp {
@@ -183,21 +263,29 @@ impl DawApp {
     fn load_project_from_path(&mut self, path: PathBuf) {
         if let Ok(contents) = fs::read_to_string(&path) {
             if let Ok(mut loaded_state) = serde_json::from_str::<DawState>(&contents) {
-                // Reload audio files and recreate sinks
+                // Reload audio files and recreate streams
                 for track in &mut loaded_state.tracks {
-                    if let Some(_path) = &track.audio_file {
+                    if let Some(path) = &track.audio_file {
+                        eprintln!("Loading audio file: {}", path.display());
                         track.load_waveform();
+                        track.create_stream(&self.output_device, &self.output_config);
                     }
                 }
                 self.state = loaded_state;
+                eprintln!("Project loaded successfully");
+            } else {
+                eprintln!("Failed to parse project file");
             }
+        } else {
+            eprintln!("Failed to read project file");
         }
     }
-}
 
-impl Default for DawApp {
-    fn default() -> Self {
-        let (_stream, stream_handle) = OutputStream::try_default().unwrap();
+    fn new() -> Self {
+        let host = cpal::default_host();
+        let output_device = host.default_output_device().expect("No output device");
+        let output_config = output_device.default_output_config().unwrap().into();
+
         let mut app = Self {
             state: DawState {
                 timeline_position: 0.0,
@@ -210,10 +298,11 @@ impl Default for DawApp {
                     })
                     .collect(),
             },
-            _stream,
-            stream_handle,
             last_update: std::time::Instant::now(),
             seek_position: None,
+            host,
+            output_device,
+            output_config,
         };
 
         // Try to load the latest project if available
@@ -222,6 +311,18 @@ impl Default for DawApp {
         }
 
         app
+    }
+
+    fn update_playback(&mut self) {
+        if self.state.is_playing {
+            for track in &mut self.state.tracks {
+                track.play();
+            }
+        } else {
+            for track in &mut self.state.tracks {
+                track.pause();
+            }
+        }
     }
 }
 
@@ -234,13 +335,8 @@ impl eframe::App for DawApp {
         if let Some(click_position) = self.seek_position.take() {
             self.state.timeline_position = click_position;
             for track in &mut self.state.tracks {
-                track.seek_to(click_position, &self.stream_handle);
-                if self.state.is_playing {
-                    if let Some(sink) = &track.sink {
-                        sink.play();
-                    }
-                    track.is_playing = true;
-                }
+                track.seek_to(click_position);
+                track.play();
             }
         }
 
@@ -248,17 +344,7 @@ impl eframe::App for DawApp {
         if ctx.input(|i| i.key_pressed(Key::Space)) {
             self.state.is_playing = !self.state.is_playing;
             self.last_update = std::time::Instant::now();
-
-            for track in &mut self.state.tracks {
-                if let Some(sink) = &track.sink {
-                    if self.state.is_playing {
-                        sink.play();
-                    } else {
-                        sink.pause();
-                    }
-                }
-                track.is_playing = self.state.is_playing;
-            }
+            self.update_playback();
         }
 
         // Update timeline position based on audio playback
@@ -273,10 +359,7 @@ impl eframe::App for DawApp {
 
                     if track.current_position >= track.duration {
                         track.current_position = 0.0;
-                        if let Some(sink) = &track.sink {
-                            sink.stop();
-                        }
-                        track.is_playing = false;
+                        track.pause();
                     }
                 }
             }
@@ -294,7 +377,7 @@ impl eframe::App for DawApp {
                         for track in &mut self.state.tracks {
                             track.is_playing = false;
                             track.current_position = 0.0;
-                            track.seek_to(0.0, &self.stream_handle);
+                            track.seek_to(0.0);
                         }
                     }
                     if ui
@@ -303,10 +386,7 @@ impl eframe::App for DawApp {
                     {
                         self.state.is_playing = !self.state.is_playing;
                         self.last_update = std::time::Instant::now();
-                        // Toggle playback for all tracks
-                        for track in &mut self.state.tracks {
-                            track.is_playing = self.state.is_playing;
-                        }
+                        self.update_playback();
                     }
                     if ui.button("⏭").clicked() {
                         self.state.timeline_position += 4.0;
@@ -314,7 +394,7 @@ impl eframe::App for DawApp {
                         for track in &mut self.state.tracks {
                             track.is_playing = false;
                             track.current_position = self.state.timeline_position;
-                            track.seek_to(self.state.timeline_position, &self.stream_handle);
+                            track.seek_to(self.state.timeline_position);
                         }
                     }
                 });
@@ -352,7 +432,7 @@ impl eframe::App for DawApp {
                     for track in &mut self.state.tracks {
                         track.is_playing = false;
                         track.current_position = self.state.timeline_position;
-                        track.seek_to(self.state.timeline_position, &self.stream_handle);
+                        track.seek_to(self.state.timeline_position);
                     }
                 }
             });
@@ -394,6 +474,8 @@ impl eframe::App for DawApp {
 
                             // Load audio and waveform
                             track.load_waveform();
+                            track.create_stream(&self.output_device, &self.output_config);
+                            eprintln!("Loaded audio file: {}", path.display());
                         }
                     }
 
@@ -401,7 +483,8 @@ impl eframe::App for DawApp {
                     if track.audio_file.is_some() {
                         ui.label(format!(
                             "{:.1}s / {:.1}s",
-                            track.current_position, track.duration
+                            track.current_position(),
+                            track.duration
                         ));
                     }
 
@@ -485,6 +568,75 @@ impl eframe::App for DawApp {
     }
 }
 
+fn load_audio(path: &Path) -> (Vec<f32>, u32) {
+    let file = File::open(path).unwrap();
+    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+
+    let mut hint = Hint::new();
+    hint.with_extension(path.extension().and_then(|s| s.to_str()).unwrap_or(""));
+
+    let format_opts = Default::default();
+    let metadata_opts = Default::default();
+    let probed = symphonia::default::get_probe()
+        .format(&hint, mss, &format_opts, &metadata_opts)
+        .unwrap();
+
+    let mut format = probed.format;
+
+    let track = format.default_track().unwrap();
+    let mut decoder = symphonia::default::get_codecs()
+        .make(&track.codec_params, &Default::default())
+        .unwrap();
+
+    let sample_rate = track.codec_params.sample_rate.unwrap();
+    let mut samples = Vec::new();
+
+    while let Ok(packet) = format.next_packet() {
+        let buffer = decoder.decode(&packet).unwrap();
+        match buffer {
+            AudioBufferRef::F32(buf) => {
+                let planes_binding = buf.planes();
+                let planes = planes_binding.planes();
+                for i in 0..planes[0].len() {
+                    for plane in planes.iter() {
+                        samples.push(plane[i]);
+                    }
+                }
+            }
+            AudioBufferRef::S32(buf) => {
+                let planes_binding = buf.planes();
+                let planes = planes_binding.planes();
+                for i in 0..planes[0].len() {
+                    for plane in planes.iter() {
+                        samples.push(plane[i] as f32 / i32::MAX as f32);
+                    }
+                }
+            }
+            AudioBufferRef::S16(buf) => {
+                let planes_binding = buf.planes();
+                let planes = planes_binding.planes();
+                for i in 0..planes[0].len() {
+                    for plane in planes.iter() {
+                        samples.push(plane[i] as f32 / i16::MAX as f32);
+                    }
+                }
+            }
+            AudioBufferRef::U8(buf) => {
+                let planes_binding = buf.planes();
+                let planes = planes_binding.planes();
+                for i in 0..planes[0].len() {
+                    for plane in planes.iter() {
+                        samples.push((plane[i] as f32 - 128.0) / 128.0);
+                    }
+                }
+            }
+            _ => panic!("Unsupported audio format"),
+        }
+    }
+
+    (samples, sample_rate)
+}
+
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([800.0, 600.0]),
@@ -493,6 +645,6 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "Monlam DAW",
         options,
-        Box::new(|_cc| Box::new(DawApp::default())),
+        Box::new(|_cc| Box::new(DawApp::new())),
     )
 }
