@@ -1,4 +1,3 @@
-use hound;
 use std::error::Error;
 
 const SAMPLE_RATE: u32 = 44100;
@@ -152,11 +151,6 @@ pub fn train_eq_to_match(
         "Processing 5 second segment from 30-35s ({} samples)",
         source_audio.len()
     );
-
-    // Ensure both files have the same number of channels
-    if source_channels != target_channels {
-        return Err("Source and target must have same number of channels".into());
-    }
 
     // Create and run trainer
     let trainer = EQTrainer::new(source_audio, target_audio, SAMPLE_RATE, num_bands);

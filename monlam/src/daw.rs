@@ -90,9 +90,9 @@ impl Track {
     }
 
     pub fn seek_to(&mut self, position: f32) {
-        let mut index = self.sample_index.load(Ordering::Relaxed);
-        index = (position * self.sample_rate as f32) as usize;
+        let index = (position * self.sample_rate as f32) as usize;
         self.sample_index.store(index, Ordering::Relaxed);
+        self.current_position = position;
     }
 
     pub fn play(&mut self) {
@@ -102,7 +102,10 @@ impl Track {
                 return;
             }
             self.is_playing = true;
-            eprintln!("Started playing audio");
+            eprintln!(
+                "Started playing audio from position {}",
+                self.current_position
+            );
         } else {
             eprintln!("No audio stream available");
         }
@@ -115,7 +118,7 @@ impl Track {
                 return;
             }
             self.is_playing = false;
-            eprintln!("Paused audio");
+            eprintln!("Paused audio at position {}", self.current_position);
         }
     }
 
@@ -148,7 +151,7 @@ impl Track {
     }
 
     pub fn current_position(&self) -> f32 {
-        self.sample_index.load(Ordering::Relaxed) as f32 / self.sample_rate as f32
+        self.current_position
     }
 
     pub fn update_grid_times(&mut self, bpm: f32) {
@@ -164,6 +167,10 @@ pub struct DawState {
     pub bpm: f32,
     pub tracks: Vec<Track>,
     pub grid_division: f32,
+    #[serde(skip)]
+    pub drag_offset: Option<f32>,
+    #[serde(skip)]
+    pub last_clicked_bar: f32,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -257,7 +264,7 @@ impl DawApp {
         }
     }
 
-    pub fn new() -> Self {
+    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         let audio = Audio::new();
 
         let mut app = Self {
@@ -274,6 +281,8 @@ impl DawApp {
                     })
                     .collect(),
                 grid_division: 0.25,
+                drag_offset: None,
+                last_clicked_bar: 0.0,
             },
             last_update: std::time::Instant::now(),
             seek_position: None,
@@ -294,6 +303,31 @@ impl DawApp {
 
     pub fn update_playback(&mut self) {
         if self.state.is_playing {
+            let now = std::time::Instant::now();
+            let delta = now.duration_since(self.last_update).as_secs_f32();
+
+            // If we have a last clicked bar, start from there
+            if self.state.last_clicked_bar > 0.0 {
+                self.state.timeline_position = self.state.last_clicked_bar;
+                eprintln!("Starting playback from bar {}", self.state.last_clicked_bar);
+                // Reset all tracks to the new position
+                for track in &mut self.state.tracks {
+                    track.update_grid_times(self.state.bpm);
+                    if self.state.timeline_position >= track.grid_start_time
+                        && self.state.timeline_position < track.grid_end_time
+                    {
+                        let relative_position =
+                            self.state.timeline_position - track.grid_start_time;
+                        track.seek_to(relative_position);
+                        track.play();
+                    }
+                }
+            }
+
+            // Update timeline position
+            self.state.timeline_position += delta;
+
+            // Update track positions and playback
             for track in &mut self.state.tracks {
                 track.update_grid_times(self.state.bpm);
 
@@ -306,6 +340,7 @@ impl DawApp {
                         track.seek_to(relative_position);
                         track.play();
                     }
+                    track.current_position = self.state.timeline_position - track.grid_start_time;
                 } else {
                     if track.is_playing {
                         track.pause();
@@ -313,6 +348,8 @@ impl DawApp {
                     track.current_position = 0.0;
                 }
             }
+
+            self.last_update = now;
         } else {
             for track in &mut self.state.tracks {
                 track.pause();

@@ -2,7 +2,7 @@ mod audio;
 mod daw;
 mod ui;
 
-use daw::{DawApp, DawState};
+use daw::DawApp;
 use eframe::egui;
 
 fn main() -> eframe::Result<()> {
@@ -13,6 +13,6 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "Monlam DAW",
         options,
-        Box::new(|_cc| Box::new(DawApp::new())),
+        Box::new(|cc| Box::new(DawApp::new(cc))),
     )
 }

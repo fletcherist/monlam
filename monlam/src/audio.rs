@@ -8,7 +8,6 @@ use symphonia::core::io::MediaSourceStream;
 use symphonia::core::probe::Hint;
 
 pub struct Audio {
-    pub host: cpal::Host,
     pub output_device: cpal::Device,
     pub output_config: cpal::StreamConfig,
 }
@@ -20,7 +19,6 @@ impl Audio {
         let output_config = output_device.default_output_config().unwrap().into();
 
         Self {
-            host,
             output_device,
             output_config,
         }
