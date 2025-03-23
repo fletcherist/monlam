@@ -353,6 +353,9 @@ impl DawApp {
 
 impl eframe::App for DawApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Set dark theme with Ableton-like colors
+        ctx.set_visuals(egui::Visuals::dark());
+
         // Force continuous repaints at 60 FPS
         ctx.request_repaint_after(std::time::Duration::from_secs_f32(1.0 / 60.0));
 
@@ -417,11 +420,13 @@ impl eframe::App for DawApp {
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            // Top toolbar
+            // Top toolbar with dark background
+            ui.add_space(8.0);
             ui.horizontal(|ui| {
-                // Transport controls
+                ui.add_space(8.0);
+                // Transport controls with modern styling
                 ui.horizontal(|ui| {
-                    if ui.button("⏮").clicked() {
+                    if ui.button(RichText::new("⏮").size(20.0)).clicked() {
                         self.state.timeline_position = 0.0;
                         for track in &mut self.state.tracks {
                             track.is_playing = false;
@@ -430,14 +435,16 @@ impl eframe::App for DawApp {
                         }
                     }
                     if ui
-                        .button(if self.state.is_playing { "⏸" } else { "▶" })
+                        .button(
+                            RichText::new(if self.state.is_playing { "⏸" } else { "▶" }).size(20.0),
+                        )
                         .clicked()
                     {
                         self.state.is_playing = !self.state.is_playing;
                         self.last_update = std::time::Instant::now();
                         self.update_playback();
                     }
-                    if ui.button("⏭").clicked() {
+                    if ui.button(RichText::new("⏭").size(20.0)).clicked() {
                         self.state.timeline_position += 4.0;
                         for track in &mut self.state.tracks {
                             track.is_playing = false;
@@ -446,46 +453,61 @@ impl eframe::App for DawApp {
                         }
                     }
                 });
+                ui.add_space(16.0);
 
-                // BPM control
-                ui.label("BPM:");
+                // BPM control with modern styling
+                ui.label(RichText::new("BPM:").size(14.0));
                 ui.add(
                     egui::DragValue::new(&mut self.state.bpm)
                         .speed(1.0)
-                        .clamp_range(20.0..=240.0),
+                        .clamp_range(20.0..=240.0)
+                        .prefix("")
+                        .suffix(""),
                 );
+                ui.add_space(16.0);
 
-                // Grid control
-                ui.label("Grid:");
+                // Grid control with modern styling
+                ui.label(RichText::new("Grid:").size(14.0));
                 ui.add(
                     egui::DragValue::new(&mut self.state.grid_division)
                         .speed(0.25)
-                        .clamp_range(0.25..=4.0),
+                        .clamp_range(0.25..=4.0)
+                        .prefix("")
+                        .suffix(""),
                 );
+                ui.add_space(16.0);
 
-                // Save/load buttons
-                if ui.button("💾 Save").clicked() {
+                // Save/load buttons with modern styling
+                if ui.button(RichText::new("💾 Save").size(14.0)).clicked() {
                     self.save_project();
                 }
-                if ui.button("📂 Open").clicked() {
+                if ui.button(RichText::new("📂 Open").size(14.0)).clicked() {
                     self.load_project();
                 }
+                ui.add_space(8.0);
             });
-
+            ui.add_space(8.0);
             ui.separator();
 
-            // Create dedicated timeline area at the top
-            let timeline_height = 50.0;
+            // Timeline area with modern styling
+            let timeline_height = 60.0;
             let (timeline_response, timeline_painter) = ui.allocate_painter(
                 egui::vec2(ui.available_width(), timeline_height),
                 egui::Sense::click_and_drag(),
             );
 
-            // Draw timeline grid and playhead in this area
-            let timeline_rect = timeline_response.rect;
-            let pixels_per_beat = timeline_rect.width() / (8.0 * 4.0); // 8 bars * 4 beats
+            // Draw timeline background
+            timeline_painter.rect_filled(
+                timeline_response.rect,
+                0.0,
+                Color32::from_rgb(40, 40, 40),
+            );
 
-            // Draw timeline grid lines (existing code moved here)
+            // Draw timeline grid lines
+            let timeline_rect = timeline_response.rect;
+            let pixels_per_beat = timeline_rect.width() / (8.0 * 4.0);
+
+            // Draw bar lines
             for bar in 0..=8 {
                 let x = timeline_rect.left() + (bar as f32 * 4.0 * pixels_per_beat);
                 timeline_painter.line_segment(
@@ -493,11 +515,24 @@ impl eframe::App for DawApp {
                         egui::pos2(x, timeline_rect.top()),
                         egui::pos2(x, timeline_rect.bottom()),
                     ],
-                    Stroke::new(2.0, Color32::from_rgb(100, 100, 100)),
+                    Stroke::new(2.0, Color32::from_rgb(60, 60, 60)),
                 );
             }
 
-            // Draw playhead in timeline area
+            // Draw beat lines
+            for beat in 0..=(8.0 * 4.0 * self.state.grid_division) as i32 {
+                let x = timeline_rect.left()
+                    + (beat as f32 * pixels_per_beat / self.state.grid_division);
+                timeline_painter.line_segment(
+                    [
+                        egui::pos2(x, timeline_rect.top()),
+                        egui::pos2(x, timeline_rect.bottom()),
+                    ],
+                    Stroke::new(1.0, Color32::from_rgb(50, 50, 50)),
+                );
+            }
+
+            // Draw playhead
             let playhead_x =
                 timeline_rect.left() + (self.state.timeline_position * pixels_per_beat);
             timeline_painter.line_segment(
@@ -505,10 +540,24 @@ impl eframe::App for DawApp {
                     egui::pos2(playhead_x, timeline_rect.top()),
                     egui::pos2(playhead_x, timeline_rect.bottom()),
                 ],
-                Stroke::new(2.0, Color32::RED),
+                Stroke::new(2.0, Color32::from_rgb(255, 50, 50)),
             );
 
-            // Handle timeline interaction ONLY in this area
+            // Draw time markers
+            for bar in 0..=8 {
+                let x = timeline_rect.left() + (bar as f32 * 4.0 * pixels_per_beat);
+                let time = (bar as f32 * 4.0 * 60.0) / self.state.bpm;
+                let time_text = format!("{:.1}s", time);
+                timeline_painter.text(
+                    egui::pos2(x + 2.0, timeline_rect.top() + 15.0),
+                    egui::Align2::LEFT_TOP,
+                    time_text,
+                    egui::FontId::proportional(12.0),
+                    Color32::from_rgb(200, 200, 200),
+                );
+            }
+
+            // Handle timeline interaction
             if timeline_response.dragged() || timeline_response.clicked() {
                 if let Some(pos) = timeline_response.interact_pointer_pos() {
                     let click_x = pos.x - timeline_rect.left();
@@ -521,17 +570,20 @@ impl eframe::App for DawApp {
                 }
             }
 
-            // Main grid area below timeline
+            // Main grid area
             let available_height = ui.available_height() - 150.0 - timeline_height;
             let (grid_response, painter) = ui.allocate_painter(
                 egui::vec2(ui.available_width(), available_height),
-                egui::Sense::click_and_drag(), // Changed back from hover
+                egui::Sense::click_and_drag(),
             );
 
             if grid_response.rect.width() > 0.0 {
                 let rect = grid_response.rect;
                 let width = rect.width();
                 let height = rect.height();
+
+                // Draw grid background
+                painter.rect_filled(rect, 0.0, Color32::from_rgb(30, 30, 30));
 
                 // Draw grid lines
                 let beats_per_bar = 4.0;
@@ -544,7 +596,7 @@ impl eframe::App for DawApp {
                     let x = rect.left() + (bar as f32 * beats_per_bar * pixels_per_beat);
                     painter.line_segment(
                         [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
-                        Stroke::new(2.0, Color32::from_rgb(100, 100, 100)),
+                        Stroke::new(2.0, Color32::from_rgb(60, 60, 60)),
                     );
                 }
 
@@ -558,34 +610,17 @@ impl eframe::App for DawApp {
                     );
                 }
 
-                // Draw time markers
-                for bar in 0..=total_bars as i32 {
-                    let x = rect.left() + (bar as f32 * beats_per_bar * pixels_per_beat);
-                    let time = (bar as f32 * beats_per_bar * 60.0) / self.state.bpm;
-                    let time_text = format!("{:.1}s", time);
-                    painter.text(
-                        egui::pos2(x + 2.0, rect.top() + 15.0),
-                        egui::Align2::LEFT_TOP,
-                        time_text,
-                        egui::FontId::proportional(12.0),
-                        Color32::WHITE,
-                    );
-                }
-
-                // Draw tracks over the grid
-                let track_height = 80.0;
-                let track_spacing = 10.0;
+                // Draw tracks
+                let track_height = 100.0;
+                let track_spacing = 8.0;
                 let total_tracks_height = (self.state.tracks.len() as f32
                     * (track_height + track_spacing))
                     + track_spacing;
 
-                // Draw tracks in grid
                 for (index, track) in self.state.tracks.iter_mut().enumerate() {
                     let track_y = rect.top()
                         + track_spacing
                         + (index as f32 * (track_height + track_spacing));
-
-                    // Calculate track position in grid
                     let track_x = rect.left()
                         + (track.grid_position * (60.0 / self.state.bpm) * pixels_per_beat);
                     let track_width = track.grid_length * (60.0 / self.state.bpm) * pixels_per_beat;
@@ -596,33 +631,39 @@ impl eframe::App for DawApp {
                         egui::vec2(track_width, track_height),
                     );
 
-                    // Draw track background with color based on state
+                    // Track background color based on state
                     let bg_color = if track.muted {
-                        Color32::from_rgb(50, 50, 50)
+                        Color32::from_rgb(40, 40, 40)
                     } else if track.soloed {
-                        Color32::from_rgb(50, 50, 100)
+                        Color32::from_rgb(40, 40, 60)
                     } else {
-                        Color32::from_rgb(30, 30, 30)
+                        Color32::from_rgb(35, 35, 35)
                     };
-                    painter.rect_filled(track_rect, 5.0, bg_color);
+                    painter.rect_filled(track_rect, 4.0, bg_color);
+
+                    // Draw track border
+                    painter.rect_stroke(
+                        track_rect,
+                        4.0,
+                        Stroke::new(1.0, Color32::from_rgb(60, 60, 60)),
+                    );
 
                     // Draw track name
                     painter.text(
-                        egui::pos2(track_x + 5.0, track_y + 20.0),
+                        egui::pos2(track_x + 8.0, track_y + 20.0),
                         egui::Align2::LEFT_TOP,
                         &track.name,
                         egui::FontId::proportional(14.0),
-                        Color32::WHITE,
+                        Color32::from_rgb(200, 200, 200),
                     );
 
-                    // Draw waveform if available
+                    // Draw waveform
                     if !track.waveform_samples.is_empty() {
                         let waveform_height = track_height - 40.0;
                         let waveform_y = track_y + 30.0;
-                        let waveform_width = track_width - 10.0;
-                        let waveform_x = track_x + 5.0;
+                        let waveform_width = track_width - 16.0;
+                        let waveform_x = track_x + 8.0;
 
-                        // Draw waveform
                         for (i, &sample) in track.waveform_samples.iter().enumerate() {
                             let x = waveform_x
                                 + (i as f32 / track.waveform_samples.len() as f32) * waveform_width;
@@ -632,7 +673,7 @@ impl eframe::App for DawApp {
                                     egui::pos2(x, waveform_y + waveform_height / 2.0 - amplitude),
                                     egui::pos2(x, waveform_y + waveform_height / 2.0 + amplitude),
                                 ],
-                                Stroke::new(2.0, Color32::from_rgb(150, 150, 150)),
+                                Stroke::new(1.0, Color32::from_rgb(100, 100, 100)),
                             );
                         }
                     }
@@ -657,26 +698,28 @@ impl eframe::App for DawApp {
                         egui::pos2(playhead_x, timeline_rect.top()),
                         egui::pos2(playhead_x, grid_response.rect.bottom()),
                     ],
-                    Stroke::new(2.0, Color32::RED),
+                    Stroke::new(2.0, Color32::from_rgb(255, 50, 50)),
                 );
             }
 
             // Track controls at the bottom
+            ui.add_space(8.0);
             ui.separator();
-            ui.add_space(10.0);
+            ui.add_space(8.0);
             for (_index, track) in self.state.tracks.iter_mut().enumerate() {
                 ui.horizontal(|ui| {
+                    ui.add_space(8.0);
                     // Track name with color based on whether it has an audio file
-                    ui.label(
-                        RichText::new(&track.name).color(if track.audio_file.is_some() {
-                            Color32::GREEN
+                    ui.label(RichText::new(&track.name).size(14.0).color(
+                        if track.audio_file.is_some() {
+                            Color32::from_rgb(100, 255, 100)
                         } else {
-                            Color32::WHITE
-                        }),
-                    );
+                            Color32::from_rgb(200, 200, 200)
+                        },
+                    ));
 
-                    // Start and End time controls in seconds
-                    ui.label("Start:");
+                    // Start and End time controls
+                    ui.label(RichText::new("Start:").size(14.0));
                     let mut start_time = track.grid_position * (60.0 / self.state.bpm);
                     if ui
                         .add(egui::DragValue::new(&mut start_time).speed(0.1))
@@ -686,7 +729,7 @@ impl eframe::App for DawApp {
                         track.grid_position = new_grid_pos;
                     }
 
-                    ui.label("End:");
+                    ui.label(RichText::new("End:").size(14.0));
                     let mut end_time =
                         (track.grid_position + track.grid_length) * (60.0 / self.state.bpm);
                     if ui
@@ -699,7 +742,7 @@ impl eframe::App for DawApp {
                     }
 
                     // File selector button
-                    if ui.button("📂").clicked() {
+                    if ui.button(RichText::new("📂").size(14.0)).clicked() {
                         if let Some(path) = FileDialog::new()
                             .add_filter("Audio", &["mp3", "wav", "ogg", "flac"])
                             .pick_file()
@@ -721,25 +764,38 @@ impl eframe::App for DawApp {
 
                     // Track position indicator
                     if track.audio_file.is_some() {
-                        ui.label(format!(
-                            "{:.1}s / {:.1}s",
-                            track.current_position(),
-                            track.duration
-                        ));
+                        ui.label(
+                            RichText::new(format!(
+                                "{:.1}s / {:.1}s",
+                                track.current_position(),
+                                track.duration
+                            ))
+                            .size(14.0),
+                        );
                     }
 
                     ui.add_space(ui.available_width() - 100.0);
 
-                    // Track controls
-                    if ui.button(if track.muted { "🔇" } else { "M" }).clicked() {
+                    // Track controls with modern styling
+                    if ui
+                        .button(RichText::new(if track.muted { "🔇" } else { "M" }).size(14.0))
+                        .clicked()
+                    {
                         track.muted = !track.muted;
                     }
-                    if ui.button(if track.soloed { "S!" } else { "S" }).clicked() {
+                    if ui
+                        .button(RichText::new(if track.soloed { "S!" } else { "S" }).size(14.0))
+                        .clicked()
+                    {
                         track.soloed = !track.soloed;
                     }
-                    if ui.button(if track.recording { "⏺" } else { "R" }).clicked() {
+                    if ui
+                        .button(RichText::new(if track.recording { "⏺" } else { "R" }).size(14.0))
+                        .clicked()
+                    {
                         track.recording = !track.recording;
                     }
+                    ui.add_space(8.0);
                 });
             }
         });
