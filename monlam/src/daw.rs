@@ -1,55 +1,117 @@
 use crate::audio::{load_audio, Audio};
+use crate::config::{load_waveform_data, save_waveform_data, WaveformData};
 use cpal::traits::StreamTrait;
 use rfd::FileDialog;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
+
+// DAW Action enum for state management
+#[derive(Debug, Clone)]
+pub enum DawAction {
+    SetTimelinePosition(f32),
+    SetLastClickedBar(f32),
+    TogglePlayback,
+    SetBpm(f32),
+    SetGridDivision(f32),
+    RewindTimeline,
+    ForwardTimeline(f32),
+    SetTrackPosition(usize, f32),
+    SetTrackLength(usize, f32),
+    ToggleTrackMute(usize),
+    ToggleTrackSolo(usize),
+    ToggleTrackRecord(usize),
+    LoadTrackAudio(usize, PathBuf, f32),
+    SeekTrack(usize, f32),
+    PlayTrack(usize),
+    PauseTrack(usize),
+    AddSampleToTrack(usize, PathBuf),
+    MoveSample(usize, usize, f32), // track_id, sample_id, new_position
+    DeleteSample(usize, usize),    // track_id, sample_id
+}
 
 const BUFFER_SIZE: usize = 1024;
 const SAMPLE_RATE: u32 = 44100;
 
 #[derive(Serialize, Deserialize)]
-pub struct Track {
+pub struct SampleWaveform {
+    pub samples: Vec<f32>,
+    pub sample_rate: u32,
+    pub duration: f32,
+}
+
+// Implement Clone for SampleWaveform
+impl Clone for SampleWaveform {
+    fn clone(&self) -> Self {
+        Self {
+            samples: self.samples.clone(),
+            sample_rate: self.sample_rate,
+            duration: self.duration,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct Sample {
+    pub id: usize,
     pub name: String,
     pub audio_file: Option<PathBuf>,
-    pub muted: bool,
-    pub soloed: bool,
-    pub recording: bool,
+    pub waveform_file: Option<PathBuf>,
     #[serde(skip)]
     stream: Option<cpal::Stream>,
     #[serde(skip)]
     sample_index: Arc<AtomicUsize>,
     #[serde(skip)]
     audio_buffer: Arc<Mutex<Vec<f32>>>,
-    pub duration: f32,
     pub current_position: f32,
-    pub waveform_samples: Vec<f32>,
-    pub sample_rate: u32,
+    #[serde(skip)]
+    pub waveform: Option<SampleWaveform>,
     pub is_playing: bool,
     pub grid_position: f32,   // Position in the grid (in beats)
     pub grid_length: f32,     // Length in the grid (in beats)
-    pub grid_start_time: f32, // When this track should start playing (in seconds)
-    pub grid_end_time: f32,   // When this track should stop playing (in seconds)
+    pub grid_start_time: f32, // When this sample should start playing (in seconds)
+    pub grid_end_time: f32,   // When this sample should stop playing (in seconds)
 }
 
-impl Default for Track {
+// Manual clone implementation for Sample to handle non-cloneable fields
+impl Clone for Sample {
+    fn clone(&self) -> Self {
+        Self {
+            id: self.id,
+            name: self.name.clone(),
+            audio_file: self.audio_file.clone(),
+            waveform_file: self.waveform_file.clone(),
+            stream: None, // Stream can't be cloned
+            sample_index: Arc::new(AtomicUsize::new(0)),
+            audio_buffer: Arc::new(Mutex::new(vec![0.0; 1024 * 1024])),
+            current_position: self.current_position,
+            waveform: self.waveform.clone(),
+            is_playing: self.is_playing,
+            grid_position: self.grid_position,
+            grid_length: self.grid_length,
+            grid_start_time: self.grid_start_time,
+            grid_end_time: self.grid_end_time,
+        }
+    }
+}
+
+impl Default for Sample {
     fn default() -> Self {
         Self {
+            id: 0,
             name: String::new(),
             audio_file: None,
-            muted: false,
-            soloed: false,
-            recording: false,
+            waveform_file: None,
             stream: None,
             sample_index: Arc::new(AtomicUsize::new(0)),
             audio_buffer: Arc::new(Mutex::new(vec![0.0; 1024 * 1024])),
-            duration: 0.0,
             current_position: 0.0,
-            waveform_samples: Vec::new(),
-            sample_rate: SAMPLE_RATE,
+            waveform: None,
             is_playing: false,
             grid_position: 0.0,
             grid_length: 0.0,
@@ -59,7 +121,8 @@ impl Default for Track {
     }
 }
 
-impl Track {
+// Implementation of Sample methods
+impl Sample {
     pub fn create_stream(&mut self, audio: &Audio) {
         if self.audio_file.is_none() {
             eprintln!("Cannot create stream: No audio file loaded");
@@ -90,9 +153,11 @@ impl Track {
     }
 
     pub fn seek_to(&mut self, position: f32) {
-        let index = (position * self.sample_rate as f32) as usize;
-        self.sample_index.store(index, Ordering::Relaxed);
-        self.current_position = position;
+        if let Some(waveform) = &self.waveform {
+            let index = (position * waveform.sample_rate as f32) as usize;
+            self.sample_index.store(index, Ordering::Relaxed);
+            self.current_position = position;
+        }
     }
 
     pub fn play(&mut self) {
@@ -107,7 +172,27 @@ impl Track {
                 self.current_position
             );
         } else {
-            eprintln!("No audio stream available");
+            // Try to recreate the stream if we have an audio file but no stream
+            if self.audio_file.is_some() && self.audio_buffer.lock().is_ok() {
+                eprintln!("Recreating audio stream for {}", self.name);
+                let audio = Audio::new();
+                self.create_stream(&audio);
+                if let Some(new_stream) = &self.stream {
+                    if let Err(e) = new_stream.play() {
+                        eprintln!("Failed to play recreated stream: {}", e);
+                        return;
+                    }
+                    self.is_playing = true;
+                    eprintln!(
+                        "Started playing recreated audio from position {}",
+                        self.current_position
+                    );
+                } else {
+                    eprintln!("Failed to recreate audio stream for {}", self.name);
+                }
+            } else {
+                eprintln!("No audio stream available for sample {}", self.name);
+            }
         }
     }
 
@@ -122,16 +207,15 @@ impl Track {
         }
     }
 
-    pub fn load_waveform(&mut self) {
+    pub fn load_waveform(&mut self, project_path: Option<&Path>) {
         if let Some(path) = &self.audio_file {
             let path = path.clone();
             let (samples, sample_rate) = load_audio(&path);
-            self.sample_rate = sample_rate;
-            self.duration = samples.len() as f32 / sample_rate as f32;
-            self.grid_length = self.duration * (120.0 / 60.0);
+            let duration: f32 = samples.len() as f32 / sample_rate as f32;
+            self.grid_length = duration * (120.0 / 60.0);
 
             let downsample_factor = samples.len() / 1000;
-            self.waveform_samples = samples
+            let waveform_samples: Vec<f32> = samples
                 .chunks(downsample_factor)
                 .map(|chunk| chunk.iter().map(|&s| s.abs()).fold(0.0, f32::max))
                 .collect();
@@ -147,6 +231,38 @@ impl Track {
             } else {
                 eprintln!("Failed to lock audio buffer for writing");
             }
+
+            // Save waveform data if we have a project path
+            if let Some(project_path) = project_path {
+                let waveform_data = WaveformData {
+                    samples: waveform_samples.clone(),
+                    sample_rate,
+                    duration,
+                };
+                if let Some(waveform_path) =
+                    save_waveform_data(project_path, &self.name, &waveform_data)
+                {
+                    self.waveform_file = Some(waveform_path.clone());
+                    eprintln!("Saved waveform data to {}", waveform_path.display());
+                }
+            }
+
+            self.waveform = Some(SampleWaveform {
+                samples: waveform_samples,
+                sample_rate,
+                duration,
+            });
+        } else if let Some(waveform_path) = &self.waveform_file {
+            // Try to load waveform data from file
+            if let Some(waveform_data) = load_waveform_data(waveform_path) {
+                self.waveform = Some(SampleWaveform {
+                    samples: waveform_data.samples,
+                    sample_rate: waveform_data.sample_rate,
+                    duration: waveform_data.duration,
+                });
+                self.grid_length = waveform_data.duration * (120.0 / 60.0);
+                eprintln!("Loaded waveform data from {}", waveform_path.display());
+            }
         }
     }
 
@@ -157,6 +273,103 @@ impl Track {
     pub fn update_grid_times(&mut self, bpm: f32) {
         self.grid_start_time = self.grid_position * (60.0 / bpm);
         self.grid_end_time = (self.grid_position + self.grid_length) * (60.0 / bpm);
+    }
+
+    pub fn reset_playback(&mut self) {
+        if let Some(stream) = &self.stream {
+            if let Err(e) = stream.pause() {
+                eprintln!("Failed to pause stream during reset: {}", e);
+            }
+        }
+
+        self.is_playing = false;
+        self.seek_to(0.0);
+        self.current_position = 0.0;
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct Track {
+    pub id: usize,
+    pub name: String,
+    pub muted: bool,
+    pub soloed: bool,
+    pub recording: bool,
+    pub samples: Vec<Sample>,
+}
+
+impl Default for Track {
+    fn default() -> Self {
+        Self {
+            id: 0,
+            name: String::new(),
+            muted: false,
+            soloed: false,
+            recording: false,
+            samples: Vec::new(),
+        }
+    }
+}
+
+impl Track {
+    // Find overlapping samples - This is already implemented correctly
+    pub fn find_overlapping_samples(&self) -> Vec<(usize, usize)> {
+        let mut overlaps = Vec::new();
+
+        for i in 0..self.samples.len() {
+            for j in i + 1..self.samples.len() {
+                let sample1 = &self.samples[i];
+                let sample2 = &self.samples[j];
+
+                // Check if the samples overlap
+                if sample1.grid_position < sample2.grid_position + sample2.grid_length
+                    && sample2.grid_position < sample1.grid_position + sample1.grid_length
+                {
+                    overlaps.push((sample1.id, sample2.id));
+                }
+            }
+        }
+
+        overlaps
+    }
+
+    // Add a sample to the track
+    pub fn add_sample(&mut self, mut sample: Sample) {
+        // Generate a unique ID for the sample
+        let new_id = if self.samples.is_empty() {
+            0
+        } else {
+            self.samples.iter().map(|s| s.id).max().unwrap() + 1
+        };
+
+        sample.id = new_id;
+        self.samples.push(sample);
+    }
+
+    // Remove a sample from the track
+    pub fn remove_sample(&mut self, sample_id: usize) -> Option<Sample> {
+        if let Some(pos) = self.samples.iter().position(|s| s.id == sample_id) {
+            Some(self.samples.remove(pos))
+        } else {
+            None
+        }
+    }
+
+    // Get a sample by its ID
+    pub fn get_sample(&self, sample_id: usize) -> Option<&Sample> {
+        self.samples.iter().find(|s| s.id == sample_id)
+    }
+
+    // Get a mutable sample by its ID
+    pub fn get_sample_mut(&mut self, sample_id: usize) -> Option<&mut Sample> {
+        self.samples.iter_mut().find(|s| s.id == sample_id)
+    }
+
+    // Update grid times for all samples in the track
+    pub fn update_grid_times(&mut self, bpm: f32) {
+        for sample in &mut self.samples {
+            sample.update_grid_times(bpm);
+        }
     }
 }
 
@@ -169,13 +382,34 @@ pub struct DawState {
     pub grid_division: f32,
     #[serde(skip)]
     pub drag_offset: Option<f32>,
-    #[serde(skip)]
     pub last_clicked_bar: f32,
+    pub project_name: String,
+    pub file_path: Option<PathBuf>,
 }
 
-#[derive(Serialize, Deserialize)]
-struct Config {
-    latest_project: Option<PathBuf>,
+impl Default for DawState {
+    fn default() -> Self {
+        Self {
+            timeline_position: 0.0,
+            is_playing: false,
+            bpm: 120.0,
+            tracks: (1..=4)
+                .map(|i| Track {
+                    id: i - 1,
+                    name: format!("Track {}", i),
+                    muted: false,
+                    soloed: false,
+                    recording: false,
+                    samples: Vec::new(),
+                })
+                .collect(),
+            grid_division: 0.25,
+            drag_offset: None,
+            last_clicked_bar: 0.0,
+            project_name: String::new(),
+            file_path: None,
+        }
+    }
 }
 
 pub struct DawApp {
@@ -183,6 +417,7 @@ pub struct DawApp {
     pub last_update: std::time::Instant,
     pub seek_position: Option<f32>,
     pub audio: Audio,
+    pub dirty: bool,
 }
 
 impl DawApp {
@@ -219,12 +454,54 @@ impl DawApp {
             .add_filter("DAW Project", &["json"])
             .save_file()
         {
-            if let Ok(serialized) = serde_json::to_string_pretty(&self.state) {
-                if fs::write(&path, serialized).is_ok() {
-                    Self::save_config(Some(path));
+            // First save waveform data for each sample in each track
+            for track in &self.state.tracks {
+                for sample in &track.samples {
+                    if let Some(waveform) = &sample.waveform {
+                        let waveform_data = WaveformData {
+                            samples: waveform.samples.clone(),
+                            sample_rate: waveform.sample_rate,
+                            duration: waveform.duration,
+                        };
+                        if let Some(waveform_path) =
+                            save_waveform_data(&path, &sample.name, &waveform_data)
+                        {
+                            eprintln!("Saved waveform data to {}", waveform_path.display());
+                        }
+                    }
                 }
             }
+
+            // Then save the project state (which only includes the waveform_file path, not the actual data)
+            if let Ok(serialized) = serde_json::to_string_pretty(&self.state) {
+                if fs::write(&path, serialized).is_ok() {
+                    Self::save_config(Some(path.clone()));
+                    eprintln!("Project saved successfully to {}", path.display());
+                } else {
+                    eprintln!("Failed to write project file to {}", path.display());
+                }
+            } else {
+                eprintln!("Failed to serialize project state");
+            }
         }
+    }
+
+    pub fn autosave_project(&self) -> bool {
+        if let Some(path) = Self::load_config() {
+            if let Ok(serialized) = serde_json::to_string_pretty(&self.state) {
+                if let Err(e) = fs::write(&path, serialized) {
+                    eprintln!("Failed to auto-save project: {}", e);
+                    return false;
+                } else {
+                    eprintln!("Project auto-saved successfully to {}", path.display());
+                    return true;
+                }
+            } else {
+                eprintln!("Failed to serialize project state for auto-save");
+                return false;
+            }
+        }
+        false
     }
 
     pub fn load_project(&mut self) {
@@ -232,143 +509,565 @@ impl DawApp {
             .add_filter("DAW Project", &["json"])
             .pick_file()
         {
-            self.load_project_from_path(path.clone());
-            Self::save_config(Some(path));
+            if self.load_project_from_path(path.clone()) {
+                Self::save_config(Some(path));
+            }
         }
     }
 
-    fn load_project_from_path(&mut self, path: PathBuf) {
+    fn load_project_from_path(&mut self, path: PathBuf) -> bool {
+        eprintln!("Attempting to load project from {}", path.display());
         if let Ok(contents) = fs::read_to_string(&path) {
             if let Ok(mut loaded_state) = serde_json::from_str::<DawState>(&contents) {
-                let grid_lengths: Vec<f32> =
-                    loaded_state.tracks.iter().map(|t| t.grid_length).collect();
+                // Process each track and its samples
+                for track in &mut loaded_state.tracks {
+                    for sample in &mut track.samples {
+                        if sample.audio_file.is_some() {
+                            eprintln!(
+                                "Loading audio file for sample {} in track {}",
+                                sample.name, track.name
+                            );
+                            sample.load_waveform(Some(&path));
 
-                for (i, track) in loaded_state.tracks.iter_mut().enumerate() {
-                    if let Some(path) = &track.audio_file {
-                        eprintln!("Loading audio file: {}", path.display());
-                        track.load_waveform();
-                        track.create_stream(&self.audio);
-                        track.is_playing = false;
-                        track.current_position = 0.0;
-                        track.grid_length = grid_lengths[i];
+                            // Create audio stream for the sample
+                            sample.create_stream(&self.audio);
+
+                            // Verify stream was created successfully
+                            if sample.stream.is_none() {
+                                eprintln!("Warning: Failed to create audio stream on project load");
+                                // Try one more time with a new Audio instance
+                                let audio = Audio::new();
+                                sample.create_stream(&audio);
+                            }
+
+                            sample.is_playing = false;
+                            sample.current_position = 0.0;
+                        }
                     }
                 }
+
                 loaded_state.is_playing = false;
                 self.state = loaded_state;
                 eprintln!("Project loaded successfully");
+                return true;
             } else {
-                eprintln!("Failed to parse project file");
+                eprintln!("Failed to parse project file: {}", path.display());
             }
         } else {
-            eprintln!("Failed to read project file");
+            eprintln!("Failed to read project file: {}", path.display());
         }
+        false
     }
 
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+        // Create a new audio engine
         let audio = Audio::new();
 
+        // Initialize with default state
         let mut app = Self {
-            state: DawState {
-                timeline_position: 0.0,
-                is_playing: false,
-                bpm: 120.0,
-                tracks: (1..=4)
-                    .map(|i| Track {
-                        name: format!("Track {}", i),
-                        is_playing: false,
-                        current_position: 0.0,
-                        ..Default::default()
-                    })
-                    .collect(),
-                grid_division: 0.25,
-                drag_offset: None,
-                last_clicked_bar: 0.0,
-            },
+            state: DawState::default(),
             last_update: std::time::Instant::now(),
             seek_position: None,
             audio,
+            dirty: false,
         };
 
+        // Try to load last project if exists
         if let Some(path) = Self::load_config() {
-            app.load_project_from_path(path);
+            if path.exists() {
+                eprintln!("Loading last project from {}", path.display());
+                app.load_project_from_path(path);
+            } else {
+                eprintln!("Last project path not found: {}", path.display());
+            }
         }
 
+        // Ensure tracks are in the right state
         for track in &mut app.state.tracks {
-            track.is_playing = false;
-            track.current_position = 0.0;
+            // Remove these lines that reference fields that no longer exist on Track
+            // track.is_playing = false;
+            // track.current_position = 0.0;
+            // Instead, reset all samples in the track
+            for sample in &mut track.samples {
+                sample.is_playing = false;
+                sample.current_position = 0.0;
+            }
         }
 
         app
+    }
+
+    // Process a DAW action and update the state accordingly
+    pub fn dispatch(&mut self, action: DawAction) {
+        match action {
+            DawAction::SetTimelinePosition(position) => {
+                self.state.timeline_position = position;
+                for track in &mut self.state.tracks {
+                    for sample in &mut track.samples {
+                        sample.update_grid_times(self.state.bpm);
+                        if position >= sample.grid_start_time && position < sample.grid_end_time {
+                            let relative_position = position - sample.grid_start_time;
+                            sample.seek_to(relative_position);
+                        }
+                    }
+                }
+            }
+            DawAction::SetLastClickedBar(position) => {
+                self.state.last_clicked_bar = position;
+                // Also update timeline position immediately
+                self.state.timeline_position = position;
+                for track in &mut self.state.tracks {
+                    for sample in &mut track.samples {
+                        sample.update_grid_times(self.state.bpm);
+                        if position >= sample.grid_start_time && position < sample.grid_end_time {
+                            let relative_position = position - sample.grid_start_time;
+                            sample.seek_to(relative_position);
+                        }
+                    }
+                }
+            }
+            DawAction::TogglePlayback => {
+                let was_playing = self.state.is_playing;
+                self.state.is_playing = !was_playing;
+                self.last_update = Instant::now();
+
+                // If starting playback, make sure all samples are in a clean state
+                if !was_playing {
+                    // Reset sample playback states
+                    for track in &mut self.state.tracks {
+                        for sample in &mut track.samples {
+                            sample.reset_playback();
+                        }
+                    }
+
+                    // If we have a clicked position, prepare to seek there
+                    if self.state.last_clicked_bar > 0.0 {
+                        self.state.timeline_position = self.state.last_clicked_bar;
+                    }
+
+                    // Make sure all tracks have updated timings
+                    self.update_track_timings();
+                }
+
+                self.update_playback();
+            }
+            DawAction::SetBpm(bpm) => {
+                // Convert current timeline position from time to beats at old BPM
+                let current_position_in_beats =
+                    self.state.timeline_position * (self.state.bpm / 60.0);
+
+                // Update the BPM
+                self.state.bpm = bpm;
+
+                // Update track and sample timings
+                for track in &mut self.state.tracks {
+                    track.update_grid_times(bpm);
+                }
+
+                // Convert back to time at new BPM, maintaining the same beat position
+                self.state.timeline_position = current_position_in_beats * (60.0 / bpm);
+            }
+            DawAction::SetGridDivision(division) => {
+                self.state.grid_division = division;
+            }
+            DawAction::RewindTimeline => {
+                self.state.timeline_position = 0.0;
+                for track in &mut self.state.tracks {
+                    for sample in &mut track.samples {
+                        sample.is_playing = false;
+                        sample.current_position = 0.0;
+                        sample.seek_to(0.0);
+                    }
+                }
+            }
+            DawAction::ForwardTimeline(bars) => {
+                self.state.timeline_position += bars;
+                for track in &mut self.state.tracks {
+                    for sample in &mut track.samples {
+                        sample.is_playing = false;
+                        sample.current_position = self.state.timeline_position;
+                        sample.seek_to(self.state.timeline_position);
+                    }
+                }
+            }
+            DawAction::SetTrackPosition(track_id, new_position) => {
+                if let Some(track) = self.state.tracks.iter_mut().find(|t| t.id == track_id) {
+                    // In the new structure, we need to move all samples in the track
+                    for sample in &mut track.samples {
+                        sample.grid_position =
+                            new_position + (sample.grid_position - sample.grid_position); // Maintain relative positions
+                        sample.update_grid_times(self.state.bpm);
+                    }
+                }
+            }
+            DawAction::SetTrackLength(track_id, new_length) => {
+                // This doesn't make sense for tracks anymore as they don't have a fixed length
+                // Instead we'll interpret this as scaling all samples in the track
+                if let Some(track) = self.state.tracks.iter_mut().find(|t| t.id == track_id) {
+                    for sample in &mut track.samples {
+                        sample.grid_length = new_length; // This is simplified; in reality you'd want a more complex scaling approach
+                        sample.update_grid_times(self.state.bpm);
+                    }
+                }
+            }
+            DawAction::ToggleTrackMute(track_id) => {
+                if let Some(track) = self.state.tracks.iter_mut().find(|t| t.id == track_id) {
+                    track.muted = !track.muted;
+                }
+            }
+            DawAction::ToggleTrackSolo(track_id) => {
+                if let Some(track) = self.state.tracks.iter_mut().find(|t| t.id == track_id) {
+                    track.soloed = !track.soloed;
+                }
+            }
+            DawAction::ToggleTrackRecord(track_id) => {
+                if let Some(track) = self.state.tracks.iter_mut().find(|t| t.id == track_id) {
+                    track.recording = !track.recording;
+                }
+            }
+            DawAction::LoadTrackAudio(track_id, path, _) => {
+                // Create a new sample and add it to the track
+                if let Some(track) = self.state.tracks.iter_mut().find(|t| t.id == track_id) {
+                    let mut sample = Sample::default();
+                    sample.is_playing = false;
+                    sample.current_position = 0.0;
+                    sample.audio_file = Some(path.clone());
+                    sample.name = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("Unknown")
+                        .to_string();
+                    sample.load_waveform(None);
+
+                    // After loading the waveform, update the grid times based on current BPM
+                    sample.update_grid_times(self.state.bpm);
+
+                    // Ensure we create a stream for this sample
+                    sample.create_stream(&self.audio);
+
+                    // Verify stream was created successfully
+                    if sample.stream.is_none() {
+                        eprintln!("Warning: Failed to create audio stream on load");
+                        // Try one more time with a new Audio instance
+                        let audio = Audio::new();
+                        sample.create_stream(&audio);
+                    }
+
+                    // Add the sample to the track
+                    track.add_sample(sample);
+
+                    eprintln!("Loaded audio file: {}", path.display());
+                }
+            }
+            DawAction::SeekTrack(track_id, position) => {
+                if let Some(track) = self.state.tracks.iter_mut().find(|t| t.id == track_id) {
+                    for sample in &mut track.samples {
+                        sample.seek_to(position);
+                    }
+                }
+            }
+            DawAction::PlayTrack(track_id) => {
+                if let Some(track) = self.state.tracks.iter_mut().find(|t| t.id == track_id) {
+                    for sample in &mut track.samples {
+                        sample.play();
+                    }
+                }
+            }
+            DawAction::PauseTrack(track_id) => {
+                if let Some(track) = self.state.tracks.iter_mut().find(|t| t.id == track_id) {
+                    for sample in &mut track.samples {
+                        sample.pause();
+                    }
+                }
+            }
+            DawAction::AddSampleToTrack(track_id, path) => {
+                if let Some(track) = self.state.tracks.iter_mut().find(|t| t.id == track_id) {
+                    let mut sample = Sample::default();
+                    sample.audio_file = Some(path.clone());
+                    sample.name = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("Unknown")
+                        .to_string();
+                    sample.load_waveform(None);
+                    sample.update_grid_times(self.state.bpm);
+                    sample.create_stream(&self.audio);
+
+                    // Add the sample to the track
+                    track.add_sample(sample);
+
+                    eprintln!("Added sample to track {}: {}", track.name, path.display());
+                }
+            }
+            DawAction::MoveSample(track_id, sample_id, new_position) => {
+                if let Some(track) = self.state.tracks.iter_mut().find(|t| t.id == track_id) {
+                    if let Some(sample) = track.get_sample_mut(sample_id) {
+                        sample.grid_position = new_position;
+                        sample.update_grid_times(self.state.bpm);
+
+                        // Check for overlaps
+                        let overlaps = track.find_overlapping_samples();
+                        if !overlaps.is_empty() {
+                            eprintln!("Warning: Sample overlaps detected in track {}", track.name);
+                            for (id1, id2) in overlaps {
+                                eprintln!("  Samples {} and {} overlap", id1, id2);
+                            }
+                        }
+                    }
+                }
+            }
+            DawAction::DeleteSample(track_id, sample_id) => {
+                if let Some(track) = self.state.tracks.iter_mut().find(|t| t.id == track_id) {
+                    if let Some(sample) = track.remove_sample(sample_id) {
+                        eprintln!("Removed sample {} from track {}", sample.name, track.name);
+                    }
+                }
+            }
+        }
+    }
+
+    // Calculate if a track should be playing at the current timeline position
+    pub fn should_track_play(&self, index: usize) -> bool {
+        if let Some(track) = self.state.tracks.get(index) {
+            // Add a small epsilon to avoid floating-point precision issues
+            const EPSILON: f32 = 0.0001;
+
+            // Track should play if any of its samples should play
+            track.samples.iter().any(|sample| {
+                self.state.timeline_position + EPSILON >= sample.grid_start_time
+                    && self.state.timeline_position < sample.grid_end_time
+            })
+        } else {
+            false
+        }
+    }
+
+    // Calculate the relative position within a track based on the timeline position
+    pub fn track_relative_position(&self, index: usize) -> Option<f32> {
+        if let Some(track) = self.state.tracks.get(index) {
+            if self.should_track_play(index) {
+                // Find the first playing sample and use its relative position
+                for sample in &track.samples {
+                    if self.state.timeline_position >= sample.grid_start_time
+                        && self.state.timeline_position < sample.grid_end_time
+                    {
+                        // Round to 6 decimal places to avoid floating-point precision issues
+                        let relative_position =
+                            self.state.timeline_position - sample.grid_start_time;
+                        return Some((relative_position * 1000000.0).round() / 1000000.0);
+                    }
+                }
+                None
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    }
+
+    // Snap a position to the grid
+    pub fn snap_to_grid(&self, position: f32) -> f32 {
+        // Calculate the nearest grid line
+        let division = self.state.grid_division;
+        let lower_grid_line = (position / division).floor() * division;
+        let upper_grid_line = (position / division).ceil() * division;
+
+        // Find which grid line is closer
+        if (position - lower_grid_line) < (upper_grid_line - position) {
+            lower_grid_line
+        } else {
+            upper_grid_line
+        }
     }
 
     pub fn update_playback(&mut self) {
         if self.state.is_playing {
             let now = std::time::Instant::now();
             let delta = now.duration_since(self.last_update).as_secs_f32();
+            self.last_update = now; // Update timestamp immediately to prevent accumulation errors
 
-            // If we have a last clicked bar, start from there
-            if self.state.last_clicked_bar > 0.0 {
-                self.state.timeline_position = self.state.last_clicked_bar;
+            // Only use last_clicked_bar on the first frame of playback
+            if self.state.last_clicked_bar > 0.0 && self.seek_position.is_none() {
                 eprintln!("Starting playback from bar {}", self.state.last_clicked_bar);
-                // Reset all tracks to the new position
-                for track in &mut self.state.tracks {
-                    track.update_grid_times(self.state.bpm);
-                    if self.state.timeline_position >= track.grid_start_time
-                        && self.state.timeline_position < track.grid_end_time
-                    {
-                        let relative_position =
-                            self.state.timeline_position - track.grid_start_time;
-                        track.seek_to(relative_position);
-                        track.play();
-                    }
-                }
+                self.seek_position = Some(self.state.last_clicked_bar);
+                self.state.last_clicked_bar = 0.0; // Reset to avoid restarting continuously
+                return; // Skip this frame, we'll handle the seek on the next update
             }
 
             // Update timeline position
             self.state.timeline_position += delta;
 
-            // Update track positions and playback
-            for track in &mut self.state.tracks {
-                track.update_grid_times(self.state.bpm);
+            // First collect sample info for all tracks
+            let timeline_pos = self.state.timeline_position;
+            let mut any_sample_playing = false;
 
-                if self.state.timeline_position >= track.grid_start_time
-                    && self.state.timeline_position < track.grid_end_time
-                {
-                    if !track.is_playing {
-                        let relative_position =
-                            self.state.timeline_position - track.grid_start_time;
-                        track.seek_to(relative_position);
-                        track.play();
+            // Check for soloed tracks before mutable borrowing
+            let any_track_soloed = self.state.tracks.iter().any(|t| t.soloed);
+
+            for track in &mut self.state.tracks {
+                // Skip muted tracks
+                if track.muted {
+                    continue;
+                }
+
+                // Handle the soloing logic
+                if any_track_soloed && !track.soloed {
+                    // If any track is soloed and this one isn't, skip it
+                    continue;
+                }
+
+                for sample in &mut track.samples {
+                    sample.update_grid_times(self.state.bpm);
+
+                    let should_play = timeline_pos >= sample.grid_start_time
+                        && timeline_pos < sample.grid_end_time;
+
+                    if should_play {
+                        if !sample.is_playing {
+                            let relative_position = timeline_pos - sample.grid_start_time;
+                            sample.seek_to(relative_position);
+                            sample.play();
+                        }
+
+                        let relative_position = timeline_pos - sample.grid_start_time;
+                        sample.current_position = relative_position;
+                        any_sample_playing = true;
+                    } else {
+                        if sample.is_playing {
+                            sample.pause();
+                        }
                     }
-                    track.current_position = self.state.timeline_position - track.grid_start_time;
-                } else {
-                    if track.is_playing {
-                        track.pause();
-                    }
-                    track.current_position = 0.0;
                 }
             }
 
-            self.last_update = now;
+            // Check if we've reached the end of all samples
+            if !any_sample_playing {
+                let all_samples_past = self.state.tracks.iter().all(|track| {
+                    track
+                        .samples
+                        .iter()
+                        .all(|sample| self.state.timeline_position >= sample.grid_end_time)
+                });
+
+                if all_samples_past && !self.state.tracks.iter().all(|t| t.samples.is_empty()) {
+                    // We've reached the end of all samples, restart from beginning
+                    eprintln!("Reached end of all samples, rewinding");
+                    self.dispatch(DawAction::RewindTimeline);
+                }
+            }
         } else {
+            // If not playing, make sure all samples are paused
             for track in &mut self.state.tracks {
-                track.pause();
-                track.current_position = 0.0;
+                for sample in &mut track.samples {
+                    if sample.is_playing {
+                        sample.pause();
+                    }
+                }
             }
         }
     }
 
     pub fn on_exit(&mut self) {
-        if let Some(path) = Self::load_config() {
-            if let Ok(serialized) = serde_json::to_string_pretty(&self.state) {
-                if let Err(e) = fs::write(&path, serialized) {
-                    eprintln!("Failed to auto-save project: {}", e);
-                } else {
-                    eprintln!("Project auto-saved successfully");
-                }
-            } else {
-                eprintln!("Failed to serialize project state for auto-save");
-            }
+        eprintln!("Application exiting, auto-saving project...");
+        self.autosave_project();
+    }
+
+    // Update track and sample grid_start_time and grid_end_time when BPM changes
+    pub fn update_track_timings(&mut self) {
+        let bpm = self.state.bpm;
+        for track in &mut self.state.tracks {
+            track.update_grid_times(bpm);
         }
     }
+
+    // Calculate if a sample should be playing at the current timeline position
+    pub fn should_sample_play(&self, track_id: usize, sample_id: usize) -> bool {
+        if let Some(track) = self.state.tracks.iter().find(|t| t.id == track_id) {
+            if let Some(sample) = track.samples.iter().find(|s| s.id == sample_id) {
+                // Add a small epsilon to avoid floating-point precision issues
+                const EPSILON: f32 = 0.0001;
+                self.state.timeline_position + EPSILON >= sample.grid_start_time
+                    && self.state.timeline_position < sample.grid_end_time
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+    }
+
+    // Calculate the relative position within a sample based on the timeline position
+    pub fn sample_relative_position(&self, track_id: usize, sample_id: usize) -> Option<f32> {
+        if let Some(track) = self.state.tracks.iter().find(|t| t.id == track_id) {
+            if let Some(sample) = track.samples.iter().find(|s| s.id == sample_id) {
+                if self.should_sample_play(track_id, sample_id) {
+                    // Round to 6 decimal places to avoid floating-point precision issues
+                    let relative_position = self.state.timeline_position - sample.grid_start_time;
+                    Some((relative_position * 1000000.0).round() / 1000000.0)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    }
+
+    #[cfg(test)]
+    pub fn new_test() -> Self {
+        let bpm = 120.0;
+        let mut app = DawApp {
+            state: DawState {
+                tracks: Vec::new(),
+                timeline_position: 0.0,
+                is_playing: false,
+                bpm,
+                grid_division: 0.25,
+                drag_offset: None,
+                last_clicked_bar: 0.0,
+                project_name: "Test Project".to_string(),
+                file_path: None,
+            },
+            audio: Audio::new(),
+            last_update: std::time::Instant::now(),
+            seek_position: None,
+            dirty: false,
+        };
+
+        // Create a default test track
+        let mut track = Track::default();
+        track.id = 0;
+        track.name = "Test Track".to_string();
+
+        // Add a sample to the track
+        let mut sample = Sample::default();
+        sample.id = 0;
+        sample.name = "Test Sample".to_string();
+        sample.grid_position = 0.0; // position in beats
+        sample.grid_length = 4.0; // length in beats
+        sample.update_grid_times(bpm);
+
+        track.samples.push(sample);
+        app.state.tracks.push(track);
+
+        app
+    }
+
+    // Helper method to convert beats to time in seconds based on BPM
+    pub fn beat_to_time(&self, beats: f32) -> f32 {
+        beats * (60.0 / self.state.bpm)
+    }
+
+    // Helper method to convert time in seconds to beats based on BPM
+    pub fn time_to_beat(&self, time: f32) -> f32 {
+        time * (self.state.bpm / 60.0)
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct Config {
+    latest_project: Option<PathBuf>,
 }
