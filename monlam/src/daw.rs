@@ -32,7 +32,9 @@ pub enum DawAction {
     PauseTrack(usize),
     AddSampleToTrack(usize, PathBuf),
     MoveSample(usize, usize, f32), // track_id, sample_id, new_position
+    SetSampleLength(usize, usize, f32), // track_id, sample_id, new_length
     DeleteSample(usize, usize),    // track_id, sample_id
+    SetSampleTrimPoints(usize, usize, f32, f32), // track_id, sample_id, start, end
 }
 
 const BUFFER_SIZE: usize = 1024;
@@ -76,6 +78,8 @@ pub struct Sample {
     pub grid_length: f32,     // Length in the grid (in beats)
     pub grid_start_time: f32, // When this sample should start playing (in seconds)
     pub grid_end_time: f32,   // When this sample should stop playing (in seconds)
+    pub trim_start: f32,      // Start trim position in seconds (0.0 = beginning of sample)
+    pub trim_end: f32,        // End trim position in seconds (0.0 = use full sample length)
 }
 
 // Manual clone implementation for Sample to handle non-cloneable fields
@@ -96,6 +100,8 @@ impl Clone for Sample {
             grid_length: self.grid_length,
             grid_start_time: self.grid_start_time,
             grid_end_time: self.grid_end_time,
+            trim_start: self.trim_start,
+            trim_end: self.trim_end,
         }
     }
 }
@@ -117,6 +123,8 @@ impl Default for Sample {
             grid_length: 0.0,
             grid_start_time: 0.0,
             grid_end_time: 0.0,
+            trim_start: 0.0,
+            trim_end: 0.0,
         }
     }
 }
@@ -154,7 +162,9 @@ impl Sample {
 
     pub fn seek_to(&mut self, position: f32) {
         if let Some(waveform) = &self.waveform {
-            let index = (position * waveform.sample_rate as f32) as usize;
+            // Apply trim_start offset to the position
+            let effective_position = self.trim_start + position;
+            let index = (effective_position * waveform.sample_rate as f32) as usize;
             self.sample_index.store(index, Ordering::Relaxed);
             self.current_position = position;
         }
@@ -162,14 +172,21 @@ impl Sample {
 
     pub fn play(&mut self) {
         if let Some(stream) = &self.stream {
+            // Start playing at the effective position (including trim_start)
+            let effective_position = self.trim_start + self.current_position;
+            let index = (effective_position
+                * self.waveform.as_ref().map_or(44100, |w| w.sample_rate) as f32)
+                as usize;
+            self.sample_index.store(index, Ordering::Relaxed);
+
             if let Err(e) = stream.play() {
                 eprintln!("Failed to play stream: {}", e);
                 return;
             }
             self.is_playing = true;
             eprintln!(
-                "Started playing audio from position {}",
-                self.current_position
+                "Started playing audio from position {} (effective: {})",
+                self.current_position, effective_position
             );
         } else {
             // Try to recreate the stream if we have an audio file but no stream
@@ -207,12 +224,32 @@ impl Sample {
         }
     }
 
-    pub fn load_waveform(&mut self, project_path: Option<&Path>) {
+    pub fn load_waveform(&mut self, project_path: Option<&Path>, bpm: Option<f32>) {
         if let Some(path) = &self.audio_file {
             let path = path.clone();
             let (samples, sample_rate) = load_audio(&path);
             let duration: f32 = samples.len() as f32 / sample_rate as f32;
-            self.grid_length = duration * (120.0 / 60.0);
+
+            // Initialize trim_end to the full duration if it's not set
+            if self.trim_end == 0.0 {
+                self.trim_end = duration;
+            }
+
+            // Calculate grid length based on the trimmed duration
+            let beats_per_second = bpm.unwrap_or(120.0) / 60.0;
+            let effective_duration = if self.trim_end <= 0.0 {
+                duration - self.trim_start
+            } else {
+                self.trim_end - self.trim_start
+            };
+
+            // Calculate grid length based on the trimmed duration
+            self.grid_length = effective_duration * beats_per_second * 0.5;
+
+            eprintln!(
+                "Sample loaded with duration: {:.2}s, effective duration: {:.2}s, grid_length (beats): {:.2}",
+                duration, effective_duration, self.grid_length
+            );
 
             let downsample_factor = samples.len() / 1000;
             let waveform_samples: Vec<f32> = samples
@@ -260,14 +297,20 @@ impl Sample {
                     sample_rate: waveform_data.sample_rate,
                     duration: waveform_data.duration,
                 });
-                self.grid_length = waveform_data.duration * (120.0 / 60.0);
-                eprintln!("Loaded waveform data from {}", waveform_path.display());
+
+                // Calculate the effective duration and grid length
+                let beats_per_second = bpm.unwrap_or(120.0) / 60.0;
+                let effective_duration = if self.trim_end <= 0.0 {
+                    waveform_data.duration - self.trim_start
+                } else {
+                    self.trim_end - self.trim_start
+                };
+                self.grid_length = effective_duration * beats_per_second * 0.5;
+
+                eprintln!("Loaded waveform data from {} with duration: {:.2}s, effective duration: {:.2}s, grid_length (beats): {:.2}", 
+                         waveform_path.display(), waveform_data.duration, effective_duration, self.grid_length);
             }
         }
-    }
-
-    pub fn current_position(&self) -> f32 {
-        self.current_position
     }
 
     pub fn update_grid_times(&mut self, bpm: f32) {
@@ -285,6 +328,41 @@ impl Sample {
         self.is_playing = false;
         self.seek_to(0.0);
         self.current_position = 0.0;
+    }
+
+    // Add method to set trim points
+    pub fn set_trim_points(&mut self, start: f32, end: f32) {
+        if let Some(waveform) = &self.waveform {
+            // Ensure trim points are within valid range
+            let valid_start = start.max(0.0).min(waveform.duration);
+            let valid_end = if end <= 0.0 {
+                waveform.duration
+            } else {
+                end.max(valid_start).min(waveform.duration)
+            };
+
+            self.trim_start = valid_start;
+            self.trim_end = valid_end;
+
+            // Recalculate grid length based on trimmed duration
+            let effective_duration = self.trim_end - self.trim_start;
+            // Use a default BPM of 120 for calculations
+            let beats_per_second = 120.0 / 60.0;
+            self.grid_length = effective_duration * beats_per_second * 0.5;
+
+            // Reset playback position
+            self.current_position = 0.0;
+            let index = (self.trim_start * waveform.sample_rate as f32) as usize;
+            self.sample_index.store(index, Ordering::Relaxed);
+
+            eprintln!(
+                "Set trim points: start={:.2}s, end={:.2}s, effective duration={:.2}s, new grid_length={:.2}",
+                self.trim_start,
+                self.trim_end,
+                effective_duration,
+                self.grid_length
+            );
+        }
     }
 }
 
@@ -417,7 +495,6 @@ pub struct DawApp {
     pub last_update: std::time::Instant,
     pub seek_position: Option<f32>,
     pub audio: Audio,
-    pub dirty: bool,
 }
 
 impl DawApp {
@@ -527,7 +604,7 @@ impl DawApp {
                                 "Loading audio file for sample {} in track {}",
                                 sample.name, track.name
                             );
-                            sample.load_waveform(Some(&path));
+                            sample.load_waveform(Some(&path), Some(loaded_state.bpm));
 
                             // Create audio stream for the sample
                             sample.create_stream(&self.audio);
@@ -569,7 +646,6 @@ impl DawApp {
             last_update: std::time::Instant::now(),
             seek_position: None,
             audio,
-            dirty: false,
         };
 
         // Try to load last project if exists
@@ -737,10 +813,16 @@ impl DawApp {
                         .and_then(|n| n.to_str())
                         .unwrap_or("Unknown")
                         .to_string();
-                    sample.load_waveform(None);
+                    sample.load_waveform(None, Some(self.state.bpm));
 
                     // After loading the waveform, update the grid times based on current BPM
                     sample.update_grid_times(self.state.bpm);
+
+                    // Initialize trim points
+                    if let Some(waveform) = &sample.waveform {
+                        sample.trim_start = 0.0;
+                        sample.trim_end = waveform.duration;
+                    }
 
                     // Ensure we create a stream for this sample
                     sample.create_stream(&self.audio);
@@ -789,12 +871,51 @@ impl DawApp {
                         .and_then(|n| n.to_str())
                         .unwrap_or("Unknown")
                         .to_string();
-                    sample.load_waveform(None);
+                    sample.load_waveform(None, Some(self.state.bpm));
                     sample.update_grid_times(self.state.bpm);
                     sample.create_stream(&self.audio);
 
                     // Add the sample to the track
                     track.add_sample(sample);
+                    let new_sample_id = track.samples.last().map(|s| s.id).unwrap_or(0);
+
+                    // Now check for and adjust any overlapping samples
+                    if let Some(new_sample) = track.get_sample(new_sample_id) {
+                        let current_sample_start = new_sample.grid_position;
+                        let current_sample_end = new_sample.grid_position + new_sample.grid_length;
+
+                        // Find overlapping samples
+                        let overlapping_samples: Vec<usize> = track
+                            .samples
+                            .iter()
+                            .filter(|s| s.id != new_sample_id) // Skip the newly added sample
+                            .filter(|s| {
+                                let other_start = s.grid_position;
+                                let other_end = s.grid_position + s.grid_length;
+
+                                // Check if the samples overlap
+                                (current_sample_start < other_end
+                                    && current_sample_end > other_start)
+                            })
+                            .map(|s| s.id)
+                            .collect();
+
+                        // Adjust the length of overlapping samples
+                        for overlap_id in overlapping_samples {
+                            if let Some(other_sample) = track.get_sample_mut(overlap_id) {
+                                // If this is a sample that starts before our new sample
+                                if other_sample.grid_position < current_sample_start {
+                                    // Adjust its length to end exactly at the start of our new sample
+                                    let new_length =
+                                        current_sample_start - other_sample.grid_position;
+                                    eprintln!("Adjusting sample {} length from {} to {} due to overlap with new sample {}", 
+                                              other_sample.id, other_sample.grid_length, new_length, new_sample_id);
+                                    other_sample.grid_length = new_length;
+                                    other_sample.update_grid_times(self.state.bpm);
+                                }
+                            }
+                        }
+                    }
 
                     eprintln!("Added sample to track {}: {}", track.name, path.display());
                 }
@@ -805,12 +926,84 @@ impl DawApp {
                         sample.grid_position = new_position;
                         sample.update_grid_times(self.state.bpm);
 
-                        // Check for overlaps
-                        let overlaps = track.find_overlapping_samples();
-                        if !overlaps.is_empty() {
-                            eprintln!("Warning: Sample overlaps detected in track {}", track.name);
-                            for (id1, id2) in overlaps {
-                                eprintln!("  Samples {} and {} overlap", id1, id2);
+                        // Adjust overlapping samples
+                        // First, find all samples that this sample would overlap with
+                        let current_sample_start = sample.grid_position;
+                        let current_sample_end = sample.grid_position + sample.grid_length;
+
+                        // Collect samples that overlap with the current sample
+                        let overlapping_samples: Vec<usize> = track
+                            .samples
+                            .iter()
+                            .filter(|s| s.id != sample_id) // Skip the current sample
+                            .filter(|s| {
+                                let other_start = s.grid_position;
+                                let other_end = s.grid_position + s.grid_length;
+
+                                // Check if the samples overlap
+                                (current_sample_start < other_end
+                                    && current_sample_end > other_start)
+                            })
+                            .map(|s| s.id)
+                            .collect();
+
+                        // Adjust the length of overlapping samples
+                        for overlap_id in overlapping_samples {
+                            if let Some(other_sample) = track.get_sample_mut(overlap_id) {
+                                // If this is a sample that starts before our current sample
+                                if other_sample.grid_position < current_sample_start {
+                                    // Adjust its length to end exactly at the start of our current sample
+                                    let new_length =
+                                        current_sample_start - other_sample.grid_position;
+                                    eprintln!("Adjusting sample {} length from {} to {} due to overlap with sample {}", 
+                                              other_sample.id, other_sample.grid_length, new_length, sample_id);
+                                    other_sample.grid_length = new_length;
+                                    other_sample.update_grid_times(self.state.bpm);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            DawAction::SetSampleLength(track_id, sample_id, new_length) => {
+                if let Some(track) = self.state.tracks.iter_mut().find(|t| t.id == track_id) {
+                    if let Some(sample) = track.get_sample_mut(sample_id) {
+                        sample.grid_length = new_length;
+                        sample.update_grid_times(self.state.bpm);
+
+                        // Handle any potential overlaps after changing length
+                        let current_sample_start = sample.grid_position;
+                        let current_sample_end = sample.grid_position + sample.grid_length;
+
+                        // Find samples that might now overlap with this one
+                        let overlapping_samples: Vec<usize> = track
+                            .samples
+                            .iter()
+                            .filter(|s| s.id != sample_id) // Skip the current sample
+                            .filter(|s| {
+                                let other_start = s.grid_position;
+                                let other_end = s.grid_position + s.grid_length;
+
+                                // Check if the samples overlap
+                                (current_sample_start < other_end
+                                    && current_sample_end > other_start)
+                            })
+                            .map(|s| s.id)
+                            .collect();
+
+                        // Adjust the length of overlapping samples
+                        for overlap_id in overlapping_samples {
+                            if let Some(other_sample) = track.get_sample_mut(overlap_id) {
+                                // If this is a sample that starts before our current sample
+                                if other_sample.grid_position < current_sample_start {
+                                    // Adjust its length to end exactly at the start of our current sample
+                                    let new_length =
+                                        current_sample_start - other_sample.grid_position;
+                                    eprintln!("Adjusting sample {} length from {} to {} due to overlap with sample {}", 
+                                            other_sample.id, other_sample.grid_length, new_length, sample_id);
+                                    other_sample.grid_length = new_length;
+                                    other_sample.update_grid_times(self.state.bpm);
+                                }
                             }
                         }
                     }
@@ -823,46 +1016,50 @@ impl DawApp {
                     }
                 }
             }
-        }
-    }
+            DawAction::SetSampleTrimPoints(track_id, sample_id, start, end) => {
+                if let Some(track) = self.state.tracks.iter_mut().find(|t| t.id == track_id) {
+                    if let Some(sample) = track.get_sample_mut(sample_id) {
+                        sample.set_trim_points(start, end);
+                        sample.update_grid_times(self.state.bpm);
 
-    // Calculate if a track should be playing at the current timeline position
-    pub fn should_track_play(&self, index: usize) -> bool {
-        if let Some(track) = self.state.tracks.get(index) {
-            // Add a small epsilon to avoid floating-point precision issues
-            const EPSILON: f32 = 0.0001;
+                        // Check for overlaps with other samples after changing trim points
+                        let current_sample_start = sample.grid_position;
+                        let current_sample_end = sample.grid_position + sample.grid_length;
 
-            // Track should play if any of its samples should play
-            track.samples.iter().any(|sample| {
-                self.state.timeline_position + EPSILON >= sample.grid_start_time
-                    && self.state.timeline_position < sample.grid_end_time
-            })
-        } else {
-            false
-        }
-    }
+                        // Find samples that might now overlap with this one
+                        let overlapping_samples: Vec<usize> = track
+                            .samples
+                            .iter()
+                            .filter(|s| s.id != sample_id) // Skip the current sample
+                            .filter(|s| {
+                                let other_start = s.grid_position;
+                                let other_end = s.grid_position + s.grid_length;
 
-    // Calculate the relative position within a track based on the timeline position
-    pub fn track_relative_position(&self, index: usize) -> Option<f32> {
-        if let Some(track) = self.state.tracks.get(index) {
-            if self.should_track_play(index) {
-                // Find the first playing sample and use its relative position
-                for sample in &track.samples {
-                    if self.state.timeline_position >= sample.grid_start_time
-                        && self.state.timeline_position < sample.grid_end_time
-                    {
-                        // Round to 6 decimal places to avoid floating-point precision issues
-                        let relative_position =
-                            self.state.timeline_position - sample.grid_start_time;
-                        return Some((relative_position * 1000000.0).round() / 1000000.0);
+                                // Check if the samples overlap
+                                (current_sample_start < other_end
+                                    && current_sample_end > other_start)
+                            })
+                            .map(|s| s.id)
+                            .collect();
+
+                        // Adjust the length of overlapping samples
+                        for overlap_id in overlapping_samples {
+                            if let Some(other_sample) = track.get_sample_mut(overlap_id) {
+                                // If this is a sample that starts before our current sample
+                                if other_sample.grid_position < current_sample_start {
+                                    // Adjust its length to end exactly at the start of our current sample
+                                    let new_length =
+                                        current_sample_start - other_sample.grid_position;
+                                    eprintln!("Adjusting sample {} length from {} to {} due to overlap with sample {}", 
+                                            other_sample.id, other_sample.grid_length, new_length, sample_id);
+                                    other_sample.grid_length = new_length;
+                                    other_sample.update_grid_times(self.state.bpm);
+                                }
+                            }
+                        }
                     }
                 }
-                None
-            } else {
-                None
             }
-        } else {
-            None
         }
     }
 
@@ -917,6 +1114,8 @@ impl DawApp {
                     continue;
                 }
 
+                // Since we're now handling overlaps by adjusting sample lengths,
+                // we don't need special overlap detection during playback
                 for sample in &mut track.samples {
                     sample.update_grid_times(self.state.bpm);
 
@@ -932,7 +1131,27 @@ impl DawApp {
 
                         let relative_position = timeline_pos - sample.grid_start_time;
                         sample.current_position = relative_position;
-                        any_sample_playing = true;
+
+                        // Check if we've reached the trim_end point
+                        if let Some(waveform) = &sample.waveform {
+                            // Calculate the position within the actual audio file
+                            let effective_position = sample.trim_start + relative_position;
+
+                            // If trim_end is set (> 0) and we've reached it, pause playback
+                            if sample.trim_end > 0.0 && effective_position >= sample.trim_end {
+                                if sample.is_playing {
+                                    sample.pause();
+                                    eprintln!(
+                                        "Reached trim end point at {}s for sample {}",
+                                        sample.trim_end, sample.name
+                                    );
+                                }
+                            } else {
+                                any_sample_playing = true;
+                            }
+                        } else {
+                            any_sample_playing = true;
+                        }
                     } else {
                         if sample.is_playing {
                             sample.pause();
@@ -1034,7 +1253,6 @@ impl DawApp {
             audio: Audio::new(),
             last_update: std::time::Instant::now(),
             seek_position: None,
-            dirty: false,
         };
 
         // Create a default test track

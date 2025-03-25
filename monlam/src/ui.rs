@@ -216,8 +216,8 @@ struct Grid<'a> {
         bool,
         bool,
         bool,
-        Vec<(usize, String, f32, f32, Vec<f32>)>,
-    )>, // Track ID, Name, muted, soloed, recording, samples: (Sample ID, name, position, length, waveform)
+        Vec<(usize, String, f32, f32, Vec<f32>, u32, f32, f32, f32)>,
+    )>, // Track ID, Name, muted, soloed, recording, samples: (Sample ID, name, position, length, waveform, sample_rate, duration, audio_start_time, audio_end_time)
     on_track_drag: &'a mut dyn FnMut(usize, usize, f32), // track_id, sample_id, new_position
 }
 
@@ -295,8 +295,20 @@ impl<'a> Grid<'a> {
             );
 
             // Draw each sample in the track
-            for (sample_index, (sample_id, sample_name, position, length, waveform)) in
-                samples.iter().enumerate()
+            for (
+                sample_index,
+                (
+                    sample_id,
+                    sample_name,
+                    position,
+                    length,
+                    waveform,
+                    sample_rate,
+                    duration,
+                    audio_start_time,
+                    audio_end_time,
+                ),
+            ) in samples.iter().enumerate()
             {
                 if *length > 0.0 {
                     let region_left = rect.left() + *position * pixels_per_beat;
@@ -330,29 +342,48 @@ impl<'a> Grid<'a> {
                     );
 
                     // Draw waveform
-                    if !waveform.is_empty() {
-                        let num_samples = waveform.len();
-                        let samples_per_pixel = num_samples as f32 / region_width;
+                    if !waveform.is_empty() && *duration > 0.0 {
+                        let waveform_length = waveform.len();
 
-                        let mut points = Vec::new();
+                        // Since the grid_length is now based on the trimmed duration,
+                        // the region rect already represents just the trimmed portion.
+                        // We need to map waveform positions correctly to this trimmed display.
+
+                        // Calculate what portion of the original waveform we're showing
+                        let trim_start_ratio = *audio_start_time / *duration;
+                        let trim_end_ratio = *audio_end_time / *duration;
+
+                        // Draw the waveform to fit the entire region
                         for x in 0..region_width as usize {
-                            let sample_index = (x as f32 * samples_per_pixel) as usize;
-                            if sample_index < waveform.len() {
+                            // Map pixel position to position within trimmed waveform
+                            let position_in_trim = x as f32 / region_width;
+
+                            // Map back to position in full waveform
+                            let full_waveform_pos = trim_start_ratio
+                                + position_in_trim * (trim_end_ratio - trim_start_ratio);
+
+                            // Get index in the waveform data
+                            let sample_index =
+                                (full_waveform_pos * waveform_length as f32) as usize;
+
+                            if sample_index < waveform_length {
                                 let amplitude = waveform[sample_index];
+
+                                // Scale the amplitude for visualization
                                 let y_offset = amplitude * (region_rect.height() / 2.5);
                                 let center_y = region_rect.center().y;
-                                points.push(egui::Pos2::new(
-                                    region_rect.left() + x as f32,
-                                    center_y - y_offset,
-                                ));
-                                points.push(egui::Pos2::new(
-                                    region_rect.left() + x as f32,
-                                    center_y + y_offset,
-                                ));
+                                let x_pos = region_rect.left() + x as f32;
+
+                                // Draw the waveform segment
+                                painter.line_segment(
+                                    [
+                                        egui::Pos2::new(x_pos, center_y - y_offset),
+                                        egui::Pos2::new(x_pos, center_y + y_offset),
+                                    ],
+                                    Stroke::new(1.0, WAVEFORM_COLOR),
+                                );
                             }
                         }
-
-                        painter.add(egui::Shape::line(points, Stroke::new(1.0, WAVEFORM_COLOR)));
                     }
 
                     // Handle audio region dragging
@@ -390,14 +421,15 @@ struct TrackControls<'a> {
         bool,
         bool,
         bool,
-        Vec<(usize, String, f32, f32, f32, f32)>,
-    )>, // Track ID, Name, muted, soloed, recording, samples: (Sample ID, name, position, length, current position, duration)
+        Vec<(usize, String, f32, f32, f32, f32, f32, f32)>,
+    )>, // Track ID, Name, muted, soloed, recording, samples: (Sample ID, name, position, length, current position, duration, trim_start, trim_end)
     on_sample_start_change: &'a mut dyn FnMut(usize, usize, f32), // track_id, sample_id, position
     on_sample_length_change: &'a mut dyn FnMut(usize, usize, f32), // track_id, sample_id, length
     on_track_file_select: &'a mut dyn FnMut(usize),               // track_id
     on_track_mute: &'a mut dyn FnMut(usize),                      // track_id
     on_track_solo: &'a mut dyn FnMut(usize),                      // track_id
     on_track_record: &'a mut dyn FnMut(usize),                    // track_id
+    on_sample_trim_change: &'a mut dyn FnMut(usize, usize, f32, f32), // track_id, sample_id, trim_start, trim_end
 }
 
 impl<'a> TrackControls<'a> {
@@ -437,7 +469,17 @@ impl<'a> TrackControls<'a> {
             });
 
             // Sample controls (indented)
-            for (sample_id, sample_name, position, length, current_position, duration) in samples {
+            for (
+                sample_id,
+                sample_name,
+                position,
+                length,
+                current_position,
+                duration,
+                trim_start,
+                trim_end,
+            ) in samples
+            {
                 ui.horizontal(|ui| {
                     ui.add_space(20.0); // Indent
                     ui.label(RichText::new(format!("Sample: {}", sample_name)).size(12.0));
@@ -453,7 +495,11 @@ impl<'a> TrackControls<'a> {
                     ui.add_space(8.0);
                     ui.label(RichText::new("Length:").size(12.0));
                     let mut len = *length;
-                    ui.add(egui::DragValue::new(&mut len).speed(0.1));
+                    ui.add(
+                        egui::DragValue::new(&mut len)
+                            .speed(0.1)
+                            .clamp_range(0.1..=100.0),
+                    );
                     if len != *length {
                         (self.on_sample_length_change)(*track_id, *sample_id, len);
                     }
@@ -463,6 +509,45 @@ impl<'a> TrackControls<'a> {
                             RichText::new(format!("{:.1}s / {:.1}s", current_position, duration))
                                 .size(12.0),
                         );
+                    }
+                });
+
+                // Add trim controls in a separate row
+                ui.horizontal(|ui| {
+                    ui.add_space(30.0); // More indent
+                    ui.label(RichText::new("Trim Start:").size(12.0));
+                    let mut start = *trim_start;
+                    ui.add(
+                        egui::DragValue::new(&mut start)
+                            .speed(0.1)
+                            .suffix(" s")
+                            .clamp_range(0.0..=*duration),
+                    );
+
+                    ui.add_space(8.0);
+                    ui.label(RichText::new("Trim End:").size(12.0));
+                    let mut end = if *trim_end <= 0.0 {
+                        *duration
+                    } else {
+                        *trim_end
+                    };
+                    ui.add(
+                        egui::DragValue::new(&mut end)
+                            .speed(0.1)
+                            .suffix(" s")
+                            .clamp_range(start..=*duration),
+                    );
+
+                    // Only trigger the callback if values actually changed
+                    if start != *trim_start
+                        || end
+                            != (if *trim_end <= 0.0 {
+                                *duration
+                            } else {
+                                *trim_end
+                            })
+                    {
+                        (self.on_sample_trim_change)(*track_id, *sample_id, start, end);
                     }
                 });
             }
@@ -512,15 +597,34 @@ impl eframe::App for DawApp {
                     .samples
                     .iter()
                     .map(|sample| {
+                        let (waveform_data, sample_rate) = sample
+                            .waveform
+                            .as_ref()
+                            .map(|w| (w.samples.clone(), w.sample_rate))
+                            .unwrap_or((vec![], 44100));
+
+                        // Get the full audio duration
+                        let full_duration =
+                            sample.waveform.as_ref().map(|w| w.duration).unwrap_or(0.0);
+
+                        // Use trim points for the visual representation
+                        let audio_start_time = sample.trim_start;
+                        let audio_end_time = if sample.trim_end <= 0.0 {
+                            full_duration
+                        } else {
+                            sample.trim_end
+                        };
+
                         (
                             sample.id,
                             sample.name.clone(),
                             sample.grid_position,
                             sample.grid_length,
-                            sample
-                                .waveform
-                                .as_ref()
-                                .map_or(vec![], |w| w.samples.clone()),
+                            waveform_data,
+                            sample_rate,
+                            full_duration,
+                            audio_start_time,
+                            audio_end_time,
                         )
                     })
                     .collect();
@@ -552,6 +656,8 @@ impl eframe::App for DawApp {
                             sample.grid_length,
                             sample.current_position,
                             sample.waveform.as_ref().map_or(0.0, |w| w.duration),
+                            sample.trim_start,
+                            sample.trim_end,
                         )
                     })
                     .collect();
@@ -597,6 +703,12 @@ impl eframe::App for DawApp {
             ToggleTrackMute(usize),
             ToggleTrackSolo(usize),
             ToggleTrackRecord(usize),
+            SetSampleTrim {
+                track_id: usize,
+                sample_id: usize,
+                trim_start: f32,
+                trim_end: f32,
+            },
         }
 
         // Collect actions during UI rendering using Rc<RefCell>
@@ -738,6 +850,14 @@ impl eframe::App for DawApp {
                             .borrow_mut()
                             .push(UiAction::ToggleTrackRecord(track_id));
                     },
+                    on_sample_trim_change: &mut |track_id, sample_id, trim_start, trim_end| {
+                        actions_clone.borrow_mut().push(UiAction::SetSampleTrim {
+                            track_id,
+                            sample_id,
+                            trim_start,
+                            trim_end,
+                        });
+                    },
                 }
                 .draw(ui);
             });
@@ -800,8 +920,7 @@ impl eframe::App for DawApp {
                     sample_id,
                     length,
                 } => {
-                    self.dispatch(DawAction::SetTrackLength(*track_id, *length));
-                    // TODO: Update this to use a proper sample length action
+                    self.dispatch(DawAction::SetSampleLength(*track_id, *sample_id, *length));
                 }
                 UiAction::LoadTrackAudio(track_id) => {
                     if let Some(path) = FileDialog::new()
@@ -819,6 +938,19 @@ impl eframe::App for DawApp {
                 }
                 UiAction::ToggleTrackRecord(track_id) => {
                     self.dispatch(DawAction::ToggleTrackRecord(*track_id));
+                }
+                UiAction::SetSampleTrim {
+                    track_id,
+                    sample_id,
+                    trim_start,
+                    trim_end,
+                } => {
+                    self.dispatch(DawAction::SetSampleTrimPoints(
+                        *track_id,
+                        *sample_id,
+                        *trim_start,
+                        *trim_end,
+                    ));
                 }
             }
         }
