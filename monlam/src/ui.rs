@@ -17,6 +17,8 @@ const PLAYHEAD_COLOR: Color32 = Color32::from_rgb(255, 50, 50);
 const TRACK_BORDER_COLOR: Color32 = Color32::from_rgb(60, 60, 60);
 const TRACK_TEXT_COLOR: Color32 = Color32::from_rgb(200, 200, 200);
 const WAVEFORM_COLOR: Color32 = Color32::from_rgb(100, 100, 100);
+const SAMPLE_BORDER_COLOR: Color32 = Color32::from_rgb(60, 60, 60);
+const SCROLLBAR_SIZE: f32 = 14.0;
 
 // UI Components
 struct TransportControls<'a> {
@@ -219,35 +221,97 @@ struct Grid<'a> {
         Vec<(usize, String, f32, f32, Vec<f32>, u32, f32, f32, f32)>,
     )>, // Track ID, Name, muted, soloed, recording, samples: (Sample ID, name, position, length, waveform, sample_rate, duration, audio_start_time, audio_end_time)
     on_track_drag: &'a mut dyn FnMut(usize, usize, f32), // track_id, sample_id, new_position
+    on_track_mute: &'a mut dyn FnMut(usize),             // track_id
+    on_track_solo: &'a mut dyn FnMut(usize),             // track_id
+    on_track_record: &'a mut dyn FnMut(usize),           // track_id
+    h_scroll_offset: f32,                                // Horizontal scroll offset in seconds
+    v_scroll_offset: f32,                                // Vertical scroll offset in pixels
 }
 
 impl<'a> Grid<'a> {
     fn draw(&mut self, ui: &mut egui::Ui) {
         let available_width = ui.available_width();
-        let grid_height = TRACK_HEIGHT * self.tracks.len() as f32
+        let available_height = ui.available_height().min(500.0); // Limit max height
+
+        // Calculate grid height based on number of tracks
+        let total_grid_height = TRACK_HEIGHT * self.tracks.len() as f32
             + TRACK_SPACING * (self.tracks.len() as f32 - 1.0);
-        let (rect, _response) = ui.allocate_exact_size(
-            egui::Vec2::new(available_width, grid_height),
-            egui::Sense::click_and_drag(),
-        );
+
+        // Determine if scrollbars are needed
+        let need_v_scroll = total_grid_height > available_height;
+        let actual_width = if need_v_scroll {
+            available_width - SCROLLBAR_SIZE
+        } else {
+            available_width
+        };
 
         // Calculate time scale (in seconds per pixel)
         let pixels_per_beat = 50.0;
         let beats_per_second = self.bpm / 60.0;
         let seconds_per_pixel = 1.0 / (pixels_per_beat * beats_per_second);
 
-        let painter = ui.painter_at(rect);
-
-        // Draw grid background
-        painter.rect_filled(rect, 0.0, GRID_BACKGROUND);
-
-        // Draw grid lines
-        let num_visible_seconds = available_width * seconds_per_pixel;
+        // Calculate total timeline width in pixels
+        let num_visible_seconds = actual_width * seconds_per_pixel;
         let num_visible_beats = num_visible_seconds * beats_per_second;
         let beat_width = pixels_per_beat;
 
-        for beat in 0..=(num_visible_beats.ceil() as i32) {
-            let x = rect.left() + beat as f32 * beat_width;
+        // Estimate total timeline width (arbitrarily use 5 minutes or calculate based on samples)
+        let total_duration = 5.0 * 60.0; // 5 minutes default
+        let total_timeline_width = total_duration / seconds_per_pixel;
+
+        // Determine if horizontal scrollbar is needed
+        let need_h_scroll = true; // Always show horizontal scrollbar
+        let actual_height = if need_h_scroll {
+            available_height - SCROLLBAR_SIZE
+        } else {
+            available_height
+        };
+
+        let visible_height = if need_v_scroll {
+            actual_height
+        } else {
+            total_grid_height.min(actual_height)
+        };
+
+        // Main grid area
+        let (grid_rect, grid_response) = ui.allocate_exact_size(
+            egui::Vec2::new(actual_width, visible_height),
+            egui::Sense::click_and_drag(),
+        );
+
+        // Handle pan gesture for grid
+        if grid_response.dragged_by(egui::PointerButton::Middle) {
+            let delta = grid_response.drag_delta();
+            // Convert pixel delta to seconds for horizontal scroll
+            self.h_scroll_offset -= delta.x * seconds_per_pixel;
+            // Constrain horizontal scroll
+            self.h_scroll_offset = self
+                .h_scroll_offset
+                .max(0.0)
+                .min(total_duration - num_visible_seconds);
+
+            // Vertical scroll offset directly in pixels
+            self.v_scroll_offset -= delta.y;
+            // Constrain vertical scroll
+            self.v_scroll_offset = self
+                .v_scroll_offset
+                .max(0.0)
+                .min((total_grid_height - visible_height).max(0.0));
+        }
+
+        let painter = ui.painter_at(grid_rect);
+
+        // Draw grid background
+        painter.rect_filled(grid_rect, 0.0, GRID_BACKGROUND);
+
+        // Draw grid lines accounting for horizontal scroll
+        let h_scroll_pixels = self.h_scroll_offset / seconds_per_pixel;
+        let first_visible_beat = (self.h_scroll_offset * beats_per_second).floor() as i32;
+        let last_visible_beat = (first_visible_beat as f32 + num_visible_beats).ceil() as i32;
+
+        for beat in first_visible_beat..last_visible_beat {
+            let beat_pos = beat as f32 / beats_per_second;
+            let x = grid_rect.left() + (beat_pos - self.h_scroll_offset) / seconds_per_pixel;
             let color = if beat % 4 == 0 {
                 BAR_LINE_COLOR
             } else {
@@ -255,44 +319,178 @@ impl<'a> Grid<'a> {
             };
             painter.line_segment(
                 [
-                    egui::Pos2::new(x, rect.top()),
-                    egui::Pos2::new(x, rect.bottom()),
+                    egui::Pos2::new(x, grid_rect.top()),
+                    egui::Pos2::new(x, grid_rect.bottom()),
                 ],
                 Stroke::new(1.0, color),
             );
+
+            // Draw beat number for every bar (4 beats)
+            if beat % 4 == 0 {
+                painter.text(
+                    egui::Pos2::new(x + 4.0, grid_rect.top() + 12.0),
+                    egui::Align2::LEFT_TOP,
+                    format!("{}", beat / 4 + 1),
+                    egui::FontId::proportional(10.0),
+                    Color32::from_rgb(150, 150, 150),
+                );
+            }
         }
 
+        // Calculate controls width for track controls
+        let controls_width = 110.0;
+        let track_area_width = actual_width - controls_width;
+
         // Draw tracks and samples
-        for (i, (track_id, name, muted, soloed, recording, samples)) in
-            self.tracks.iter().enumerate()
+        let visible_track_start =
+            (self.v_scroll_offset / (TRACK_HEIGHT + TRACK_SPACING)).floor() as usize;
+        let visible_track_end = ((self.v_scroll_offset + visible_height)
+            / (TRACK_HEIGHT + TRACK_SPACING))
+            .ceil() as usize;
+        let visible_track_end = visible_track_end.min(self.tracks.len());
+
+        // Only draw visible tracks
+        for (track_idx, (track_id, name, muted, soloed, recording, samples)) in self
+            .tracks
+            .iter()
+            .enumerate()
+            .skip(visible_track_start)
+            .take(visible_track_end - visible_track_start)
         {
-            let track_top = rect.top() + i as f32 * (TRACK_HEIGHT + TRACK_SPACING);
-            let track_rect = egui::Rect::from_min_size(
-                egui::Pos2::new(rect.left(), track_top),
-                egui::Vec2::new(rect.width(), TRACK_HEIGHT),
-            );
+            let track_top = grid_rect.top() + track_idx as f32 * (TRACK_HEIGHT + TRACK_SPACING)
+                - self.v_scroll_offset;
+            let track_bottom = track_top + TRACK_HEIGHT;
 
-            // Draw track background
-            let track_color = if *muted {
-                Color32::from_rgb(40, 40, 40)
-            } else if *soloed {
-                Color32::from_rgb(40, 40, 50)
-            } else if *recording {
-                Color32::from_rgb(50, 30, 30)
-            } else {
-                Color32::from_rgb(40, 40, 40)
-            };
-            painter.rect_filled(track_rect, 4.0, track_color);
-            painter.rect_stroke(track_rect, 4.0, Stroke::new(1.0, TRACK_BORDER_COLOR));
+            // Skip tracks that are completely outside the visible area
+            if track_bottom < grid_rect.top() || track_top > grid_rect.bottom() {
+                continue;
+            }
 
-            // Draw track name
+            // Draw track border - horizontal line at the bottom of each track
+            if track_idx < self.tracks.len() - 1 {
+                painter.line_segment(
+                    [
+                        egui::Pos2::new(grid_rect.left(), track_bottom + TRACK_SPACING / 2.0),
+                        egui::Pos2::new(grid_rect.right(), track_bottom + TRACK_SPACING / 2.0),
+                    ],
+                    Stroke::new(1.0, TRACK_BORDER_COLOR),
+                );
+            }
+
+            // Draw track controls on the right side
+            let control_top = track_top + 30.0; // Move control buttons down to make room for title
+            let control_left = grid_rect.left() + track_area_width;
+
+            // Display track name on the right side, above the buttons
             painter.text(
-                egui::Pos2::new(track_rect.left() + 8.0, track_rect.top() + 16.0),
+                egui::Pos2::new(control_left + 10.0, track_top + 10.0),
                 egui::Align2::LEFT_TOP,
                 name,
                 egui::FontId::proportional(14.0),
                 TRACK_TEXT_COLOR,
             );
+
+            // Add track control buttons
+            let button_size = egui::Vec2::new(30.0, 24.0);
+            let mute_rect =
+                egui::Rect::from_min_size(egui::Pos2::new(control_left, control_top), button_size);
+
+            let solo_rect = egui::Rect::from_min_size(
+                egui::Pos2::new(control_left + button_size.x + 5.0, control_top),
+                button_size,
+            );
+
+            let record_rect = egui::Rect::from_min_size(
+                egui::Pos2::new(control_left + 2.0 * (button_size.x + 5.0), control_top),
+                button_size,
+            );
+
+            // Draw button backgrounds and text
+            let mute_color = if *muted {
+                Color32::from_rgb(150, 50, 50)
+            } else {
+                Color32::from_rgb(60, 60, 60)
+            };
+
+            let solo_color = if *soloed {
+                Color32::from_rgb(50, 150, 50)
+            } else {
+                Color32::from_rgb(60, 60, 60)
+            };
+
+            let record_color = if *recording {
+                Color32::from_rgb(150, 50, 50)
+            } else {
+                Color32::from_rgb(60, 60, 60)
+            };
+
+            // Draw button backgrounds
+            painter.rect_filled(mute_rect, 4.0, mute_color);
+            painter.rect_filled(solo_rect, 4.0, solo_color);
+            painter.rect_filled(record_rect, 4.0, record_color);
+
+            // Draw button borders
+            painter.rect_stroke(
+                mute_rect,
+                4.0,
+                Stroke::new(1.0, Color32::from_rgb(80, 80, 80)),
+            );
+            painter.rect_stroke(
+                solo_rect,
+                4.0,
+                Stroke::new(1.0, Color32::from_rgb(80, 80, 80)),
+            );
+            painter.rect_stroke(
+                record_rect,
+                4.0,
+                Stroke::new(1.0, Color32::from_rgb(80, 80, 80)),
+            );
+
+            // Draw button text
+            painter.text(
+                mute_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                if *muted { "🔇" } else { "M" },
+                egui::FontId::proportional(14.0),
+                TRACK_TEXT_COLOR,
+            );
+
+            painter.text(
+                solo_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                if *soloed { "S!" } else { "S" },
+                egui::FontId::proportional(14.0),
+                TRACK_TEXT_COLOR,
+            );
+
+            painter.text(
+                record_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                if *recording { "⏺" } else { "R" },
+                egui::FontId::proportional(14.0),
+                TRACK_TEXT_COLOR,
+            );
+
+            // Handle button clicks
+            let id_mute = ui.id().with(format!("mute_track_{}", track_id));
+            let id_solo = ui.id().with(format!("solo_track_{}", track_id));
+            let id_record = ui.id().with(format!("record_track_{}", track_id));
+
+            let mute_response = ui.interact(mute_rect, id_mute, egui::Sense::click());
+            let solo_response = ui.interact(solo_rect, id_solo, egui::Sense::click());
+            let record_response = ui.interact(record_rect, id_record, egui::Sense::click());
+
+            if mute_response.clicked() {
+                (self.on_track_mute)(*track_id);
+            }
+
+            if solo_response.clicked() {
+                (self.on_track_solo)(*track_id);
+            }
+
+            if record_response.clicked() {
+                (self.on_track_record)(*track_id);
+            }
 
             // Draw each sample in the track
             for (
@@ -311,11 +509,35 @@ impl<'a> Grid<'a> {
             ) in samples.iter().enumerate()
             {
                 if *length > 0.0 {
-                    let region_left = rect.left() + *position * pixels_per_beat;
-                    let region_width = *length * pixels_per_beat;
+                    // Calculate sample position in beats
+                    let beats_position = *position;
+                    // Convert to seconds
+                    let seconds_position = beats_position / beats_per_second;
+
+                    // Skip samples that are not visible due to horizontal scrolling
+                    if seconds_position + (*length / beats_per_second) < self.h_scroll_offset
+                        || seconds_position > self.h_scroll_offset + num_visible_seconds
+                    {
+                        continue;
+                    }
+
+                    // Calculate visible region
+                    let region_left = grid_rect.left()
+                        + (seconds_position - self.h_scroll_offset) / seconds_per_pixel;
+                    let region_width = (*length / beats_per_second) / seconds_per_pixel;
+
+                    // Clip to visible area
+                    let visible_left = region_left.max(grid_rect.left());
+                    let visible_right = (region_left + region_width).min(grid_rect.right());
+                    let visible_width = visible_right - visible_left;
+
+                    if visible_width <= 0.0 {
+                        continue;
+                    }
+
                     let region_rect = egui::Rect::from_min_size(
-                        egui::Pos2::new(region_left, track_rect.top() + 25.0),
-                        egui::Vec2::new(region_width, TRACK_HEIGHT - 30.0),
+                        egui::Pos2::new(visible_left, track_top),
+                        egui::Vec2::new(visible_width, TRACK_HEIGHT),
                     );
 
                     // Draw sample background with alternating colors for better visibility
@@ -326,37 +548,38 @@ impl<'a> Grid<'a> {
                     };
 
                     painter.rect_filled(region_rect, 4.0, sample_color);
-                    painter.rect_stroke(
-                        region_rect,
-                        4.0,
-                        Stroke::new(1.0, Color32::from_rgb(80, 80, 90)),
-                    );
+                    painter.rect_stroke(region_rect, 4.0, Stroke::new(1.0, SAMPLE_BORDER_COLOR));
 
-                    // Show sample name
-                    painter.text(
-                        egui::Pos2::new(region_rect.left() + 4.0, region_rect.top() + 12.0),
-                        egui::Align2::LEFT_TOP,
-                        sample_name,
-                        egui::FontId::proportional(10.0),
-                        TRACK_TEXT_COLOR,
-                    );
+                    // Show sample name if there's enough space
+                    if visible_width > 20.0 {
+                        painter.text(
+                            egui::Pos2::new(region_rect.left() + 4.0, region_rect.top() + 12.0),
+                            egui::Align2::LEFT_TOP,
+                            sample_name,
+                            egui::FontId::proportional(10.0),
+                            TRACK_TEXT_COLOR,
+                        );
+                    }
 
-                    // Draw waveform
+                    // Draw waveform if data is available
                     if !waveform.is_empty() && *duration > 0.0 {
                         let waveform_length = waveform.len();
-
-                        // Since the grid_length is now based on the trimmed duration,
-                        // the region rect already represents just the trimmed portion.
-                        // We need to map waveform positions correctly to this trimmed display.
 
                         // Calculate what portion of the original waveform we're showing
                         let trim_start_ratio = *audio_start_time / *duration;
                         let trim_end_ratio = *audio_end_time / *duration;
 
-                        // Draw the waveform to fit the entire region
-                        for x in 0..region_width as usize {
-                            // Map pixel position to position within trimmed waveform
-                            let position_in_trim = x as f32 / region_width;
+                        // Draw the waveform to fit the visible region
+                        for x in 0..visible_width as usize {
+                            // Map pixel position to position within visible region
+                            let position_in_visible = x as f32 / visible_width;
+
+                            // Map to position in full region
+                            let full_region_pos = (visible_left - region_left) / region_width
+                                + position_in_visible * (visible_width / region_width);
+
+                            // Map to position in trimmed region
+                            let position_in_trim = full_region_pos;
 
                             // Map back to position in full waveform
                             let full_waveform_pos = trim_start_ratio
@@ -394,23 +617,153 @@ impl<'a> Grid<'a> {
 
                     if region_response.dragged() {
                         let delta = region_response.drag_delta().x;
-                        let grid_delta = delta / pixels_per_beat;
-                        let new_position = *position + grid_delta;
+                        let time_delta = delta * seconds_per_pixel;
+                        let beat_delta = time_delta * beats_per_second;
+                        let new_position = *position + beat_delta;
                         (self.on_track_drag)(*track_id, *sample_id, new_position);
                     }
                 }
             }
         }
 
-        // Draw playhead
-        let playhead_x = rect.left() + self.timeline_position / seconds_per_pixel;
-        painter.line_segment(
-            [
-                egui::Pos2::new(playhead_x, rect.top()),
-                egui::Pos2::new(playhead_x, rect.bottom()),
-            ],
-            Stroke::new(2.0, PLAYHEAD_COLOR),
-        );
+        // Draw playhead adjusted for horizontal scroll
+        let visible_playhead_x =
+            grid_rect.left() + (self.timeline_position - self.h_scroll_offset) / seconds_per_pixel;
+
+        // Only draw playhead if it's in the visible area
+        if visible_playhead_x >= grid_rect.left() && visible_playhead_x <= grid_rect.right() {
+            painter.line_segment(
+                [
+                    egui::Pos2::new(visible_playhead_x, grid_rect.top()),
+                    egui::Pos2::new(visible_playhead_x, grid_rect.bottom()),
+                ],
+                Stroke::new(2.0, PLAYHEAD_COLOR),
+            );
+        }
+
+        // Add horizontal scrollbar if needed
+        if need_h_scroll {
+            let h_scrollbar_rect = egui::Rect::from_min_max(
+                egui::Pos2::new(grid_rect.left(), grid_rect.bottom()),
+                egui::Pos2::new(grid_rect.right(), grid_rect.bottom() + SCROLLBAR_SIZE),
+            );
+
+            let h_scrollbar_response =
+                ui.allocate_rect(h_scrollbar_rect, egui::Sense::click_and_drag());
+
+            if h_scrollbar_response.hovered() {
+                ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::ResizeHorizontal);
+            }
+
+            // Draw scrollbar background
+            painter.rect_filled(h_scrollbar_rect, 0.0, Color32::from_rgb(40, 40, 40));
+
+            // Calculate thumb size and position
+            let h_visible_ratio = num_visible_seconds / total_duration;
+            let h_thumb_width = h_visible_ratio * h_scrollbar_rect.width();
+            let h_scroll_ratio =
+                self.h_scroll_offset / (total_duration - num_visible_seconds).max(0.001);
+            let h_thumb_left = h_scrollbar_rect.left()
+                + h_scroll_ratio * (h_scrollbar_rect.width() - h_thumb_width);
+
+            let h_thumb_rect = egui::Rect::from_min_size(
+                egui::Pos2::new(h_thumb_left, h_scrollbar_rect.top()),
+                egui::Vec2::new(h_thumb_width.max(20.0), SCROLLBAR_SIZE),
+            );
+
+            // Draw scrollbar thumb
+            painter.rect_filled(h_thumb_rect, 2.0, Color32::from_rgb(100, 100, 100));
+
+            // Handle scrollbar interaction
+            if h_scrollbar_response.dragged() {
+                let mouse_pos = h_scrollbar_response
+                    .interact_pointer_pos()
+                    .unwrap_or_default();
+                let click_pos_ratio =
+                    (mouse_pos.x - h_scrollbar_rect.left()) / h_scrollbar_rect.width();
+                self.h_scroll_offset = click_pos_ratio * (total_duration - num_visible_seconds);
+                self.h_scroll_offset = self
+                    .h_scroll_offset
+                    .max(0.0)
+                    .min(total_duration - num_visible_seconds);
+            }
+        }
+
+        // Add vertical scrollbar if needed
+        if need_v_scroll {
+            let v_scrollbar_rect = egui::Rect::from_min_max(
+                egui::Pos2::new(grid_rect.right(), grid_rect.top()),
+                egui::Pos2::new(grid_rect.right() + SCROLLBAR_SIZE, grid_rect.bottom()),
+            );
+
+            let v_scrollbar_response =
+                ui.allocate_rect(v_scrollbar_rect, egui::Sense::click_and_drag());
+
+            if v_scrollbar_response.hovered() {
+                ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::ResizeVertical);
+            }
+
+            // Draw scrollbar background
+            painter.rect_filled(v_scrollbar_rect, 0.0, Color32::from_rgb(40, 40, 40));
+
+            // Calculate thumb size and position
+            let v_visible_ratio = visible_height / total_grid_height;
+            let v_thumb_height = v_visible_ratio * v_scrollbar_rect.height();
+            let v_scroll_ratio =
+                self.v_scroll_offset / (total_grid_height - visible_height).max(0.001);
+            let v_thumb_top = v_scrollbar_rect.top()
+                + v_scroll_ratio * (v_scrollbar_rect.height() - v_thumb_height);
+
+            let v_thumb_rect = egui::Rect::from_min_size(
+                egui::Pos2::new(v_scrollbar_rect.left(), v_thumb_top),
+                egui::Vec2::new(SCROLLBAR_SIZE, v_thumb_height.max(20.0)),
+            );
+
+            // Draw scrollbar thumb
+            painter.rect_filled(v_thumb_rect, 2.0, Color32::from_rgb(100, 100, 100));
+
+            // Handle scrollbar interaction
+            if v_scrollbar_response.dragged() {
+                let mouse_pos = v_scrollbar_response
+                    .interact_pointer_pos()
+                    .unwrap_or_default();
+                let click_pos_ratio =
+                    (mouse_pos.y - v_scrollbar_rect.top()) / v_scrollbar_rect.height();
+                self.v_scroll_offset = click_pos_ratio * (total_grid_height - visible_height);
+                self.v_scroll_offset = self
+                    .v_scroll_offset
+                    .max(0.0)
+                    .min((total_grid_height - visible_height).max(0.0));
+            }
+        }
+
+        // Handle scrolling with mouse wheel
+        if grid_response.hovered() {
+            let scroll_delta = ui.input(|i| i.scroll_delta);
+            // Vertical scrolling with mouse wheel
+            if scroll_delta.y != 0.0 {
+                self.v_scroll_offset += scroll_delta.y * -0.5; // Adjust sensitivity
+                self.v_scroll_offset = self
+                    .v_scroll_offset
+                    .max(0.0)
+                    .min((total_grid_height - visible_height).max(0.0));
+            }
+
+            // Horizontal scrolling with shift+wheel or horizontal wheel
+            if scroll_delta.x != 0.0 || (ui.input(|i| i.modifiers.shift) && scroll_delta.y != 0.0) {
+                let h_delta = if scroll_delta.x != 0.0 {
+                    scroll_delta.x
+                } else {
+                    scroll_delta.y
+                };
+                let time_delta = h_delta * -0.1 * seconds_per_pixel; // Adjust sensitivity
+                self.h_scroll_offset += time_delta;
+                self.h_scroll_offset = self
+                    .h_scroll_offset
+                    .max(0.0)
+                    .min(total_duration - num_visible_seconds);
+            }
+        }
     }
 }
 
@@ -709,6 +1062,10 @@ impl eframe::App for DawApp {
                 trim_start: f32,
                 trim_end: f32,
             },
+            UpdateScrollPosition {
+                h_scroll: f32,
+                v_scroll: f32,
+            },
         }
 
         // Collect actions during UI rendering using Rc<RefCell>
@@ -792,7 +1149,7 @@ impl eframe::App for DawApp {
 
                 // Grid in the middle
                 let actions_clone = actions.clone();
-                Grid {
+                let mut grid = Grid {
                     timeline_position,
                     bpm,
                     grid_division,
@@ -804,8 +1161,37 @@ impl eframe::App for DawApp {
                             position,
                         });
                     },
+                    on_track_mute: &mut |track_id| {
+                        actions_clone
+                            .borrow_mut()
+                            .push(UiAction::ToggleTrackMute(track_id));
+                    },
+                    on_track_solo: &mut |track_id| {
+                        actions_clone
+                            .borrow_mut()
+                            .push(UiAction::ToggleTrackSolo(track_id));
+                    },
+                    on_track_record: &mut |track_id| {
+                        actions_clone
+                            .borrow_mut()
+                            .push(UiAction::ToggleTrackRecord(track_id));
+                    },
+                    h_scroll_offset: self.state.h_scroll_offset,
+                    v_scroll_offset: self.state.v_scroll_offset,
+                };
+                grid.draw(ui);
+
+                // Check if scroll position changed and update
+                if grid.h_scroll_offset != self.state.h_scroll_offset
+                    || grid.v_scroll_offset != self.state.v_scroll_offset
+                {
+                    actions_clone
+                        .borrow_mut()
+                        .push(UiAction::UpdateScrollPosition {
+                            h_scroll: grid.h_scroll_offset,
+                            v_scroll: grid.v_scroll_offset,
+                        });
                 }
-                .draw(ui);
 
                 // Track controls
                 ui.add_space(8.0);
@@ -951,6 +1337,9 @@ impl eframe::App for DawApp {
                         *trim_start,
                         *trim_end,
                     ));
+                }
+                UiAction::UpdateScrollPosition { h_scroll, v_scroll } => {
+                    self.dispatch(DawAction::UpdateScrollPosition(*h_scroll, *v_scroll));
                 }
             }
         }

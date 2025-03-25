@@ -24,34 +24,14 @@ impl Audio {
         }
     }
 
-    pub fn create_stream(
-        &self,
-        audio_buffer: Arc<Mutex<Vec<f32>>>,
-        sample_index: Arc<AtomicUsize>,
-    ) -> Option<cpal::Stream> {
-        let num_channels = self.output_config.channels as usize;
-
+    pub fn create_stream_with_callback<F>(&self, mut callback: F) -> Option<cpal::Stream>
+    where
+        F: FnMut(&mut [f32]) + Send + 'static,
+    {
         match self.output_device.build_output_stream(
             &self.output_config,
-            {
-                let audio_buffer = Arc::clone(&audio_buffer);
-                let sample_index = Arc::clone(&sample_index);
-                let num_channels = num_channels;
-                move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                    let mut index = sample_index.load(Ordering::Relaxed);
-
-                    for frame in data.chunks_mut(num_channels) {
-                        for (channel, sample) in frame.iter_mut().enumerate() {
-                            let sample_idx = index * num_channels + channel;
-                            if let Ok(buffer) = audio_buffer.lock() {
-                                *sample = buffer.get(sample_idx).copied().unwrap_or(0.0);
-                            }
-                        }
-                        index += 1;
-                    }
-
-                    sample_index.store(index, Ordering::Relaxed);
-                }
+            move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                callback(data);
             },
             |err| eprintln!("Stream error: {}", err),
             None,

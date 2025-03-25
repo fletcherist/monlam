@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env;
 use std::fs;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -26,15 +28,12 @@ pub enum DawAction {
     ToggleTrackMute(usize),
     ToggleTrackSolo(usize),
     ToggleTrackRecord(usize),
-    LoadTrackAudio(usize, PathBuf, f32),
-    SeekTrack(usize, f32),
-    PlayTrack(usize),
-    PauseTrack(usize),
     AddSampleToTrack(usize, PathBuf),
     MoveSample(usize, usize, f32), // track_id, sample_id, new_position
     SetSampleLength(usize, usize, f32), // track_id, sample_id, new_length
     DeleteSample(usize, usize),    // track_id, sample_id
     SetSampleTrimPoints(usize, usize, f32, f32), // track_id, sample_id, start, end
+    UpdateScrollPosition(f32, f32), // h_scroll, v_scroll
 }
 
 const BUFFER_SIZE: usize = 1024;
@@ -80,6 +79,8 @@ pub struct Sample {
     pub grid_end_time: f32,   // When this sample should stop playing (in seconds)
     pub trim_start: f32,      // Start trim position in seconds (0.0 = beginning of sample)
     pub trim_end: f32,        // End trim position in seconds (0.0 = use full sample length)
+    #[serde(skip)]
+    total_frames: usize,
 }
 
 // Manual clone implementation for Sample to handle non-cloneable fields
@@ -92,7 +93,7 @@ impl Clone for Sample {
             waveform_file: self.waveform_file.clone(),
             stream: None, // Stream can't be cloned
             sample_index: Arc::new(AtomicUsize::new(0)),
-            audio_buffer: Arc::new(Mutex::new(vec![0.0; 1024 * 1024])),
+            audio_buffer: Arc::new(Mutex::new(Vec::new())),
             current_position: self.current_position,
             waveform: self.waveform.clone(),
             is_playing: self.is_playing,
@@ -102,6 +103,7 @@ impl Clone for Sample {
             grid_end_time: self.grid_end_time,
             trim_start: self.trim_start,
             trim_end: self.trim_end,
+            total_frames: self.total_frames,
         }
     }
 }
@@ -115,7 +117,7 @@ impl Default for Sample {
             waveform_file: None,
             stream: None,
             sample_index: Arc::new(AtomicUsize::new(0)),
-            audio_buffer: Arc::new(Mutex::new(vec![0.0; 1024 * 1024])),
+            audio_buffer: Arc::new(Mutex::new(Vec::new())),
             current_position: 0.0,
             waveform: None,
             is_playing: false,
@@ -125,6 +127,7 @@ impl Default for Sample {
             grid_end_time: 0.0,
             trim_start: 0.0,
             trim_end: 0.0,
+            total_frames: 0,
         }
     }
 }
@@ -145,40 +148,158 @@ impl Sample {
             self.is_playing = false;
         }
 
-        if self.audio_buffer.lock().is_err() {
-            self.audio_buffer = Arc::new(Mutex::new(vec![0.0; 1024 * 1024]));
+        // Make sure we have a valid audio buffer
+        if let Ok(buffer) = self.audio_buffer.lock() {
+            if buffer.is_empty() && self.audio_file.is_some() {
+                drop(buffer); // Release the lock before loading audio
+                if let Some(path) = &self.audio_file {
+                    let (samples, sample_rate) = load_audio(path);
+                    if let Ok(mut buffer) = self.audio_buffer.lock() {
+                        buffer.clear();
+                        buffer.extend_from_slice(&samples);
+                        self.total_frames = samples.len();
+                        eprintln!(
+                            "Loaded {} samples into memory at {}Hz",
+                            samples.len(),
+                            sample_rate
+                        );
+                    }
+                }
+            }
         }
+
+        // Get the original sample rate of the audio file
+        let source_sample_rate = if let Some(waveform) = &self.waveform {
+            waveform.sample_rate
+        } else {
+            SAMPLE_RATE
+        };
+
+        // Get the output device sample rate
+        let device_sample_rate = audio.output_config.sample_rate.0;
+        let rate_ratio = device_sample_rate as f32 / source_sample_rate as f32;
+
+        eprintln!(
+            "Audio source rate: {}Hz, device rate: {}Hz, ratio: {}",
+            source_sample_rate, device_sample_rate, rate_ratio
+        );
 
         let audio_buffer = Arc::clone(&self.audio_buffer);
         let sample_index = Arc::new(AtomicUsize::new(0));
+        let sample_index_clone = Arc::clone(&sample_index);
+        let trim_start = self.trim_start;
+        let trim_end = self.trim_end;
 
-        if let Some(stream) = audio.create_stream(audio_buffer, Arc::clone(&sample_index)) {
+        // Get the number of channels from the audio device
+        let num_channels = audio.output_config.channels as usize;
+
+        // Create a real-time buffer-based processing stream
+        if let Some(stream) = audio.create_stream_with_callback(move |out_buffer: &mut [f32]| {
+            // Get the current read position
+            let mut index = sample_index_clone.load(Ordering::Relaxed);
+            let buffer_lock = audio_buffer.lock();
+
+            if let Ok(buffer) = buffer_lock {
+                if !buffer.is_empty() {
+                    // Calculate trim points in samples
+                    let start_sample = (trim_start * source_sample_rate as f32) as usize;
+                    let end_sample = if trim_end <= 0.0 {
+                        buffer.len()
+                    } else {
+                        (trim_end * source_sample_rate as f32) as usize
+                    };
+
+                    // Fill the output buffer with samples, handling sample rate conversion if needed
+                    for frame_idx in 0..(out_buffer.len() / num_channels) {
+                        // Apply sample rate conversion - calculate exact position in source
+                        let exact_source_pos = (index as f32) / rate_ratio;
+                        let sample_position = exact_source_pos as usize;
+
+                        // Skip if we're outside the trim boundaries
+                        if sample_position < start_sample {
+                            index = (start_sample as f32 * rate_ratio) as usize;
+                            continue;
+                        }
+
+                        // Calculate the position in the buffer considering number of channels
+                        let buffer_position = sample_position;
+
+                        // Fill all channels
+                        for channel in 0..num_channels {
+                            let out_idx = frame_idx * num_channels + channel;
+                            if out_idx < out_buffer.len() {
+                                if buffer_position >= end_sample
+                                    || buffer_position >= buffer.len() / num_channels
+                                {
+                                    out_buffer[out_idx] = 0.0; // Silence when past the end
+                                } else {
+                                    // If we have mono audio but stereo output, duplicate the sample
+                                    // If we have stereo audio, use the appropriate channel
+                                    let buffer_idx =
+                                        if buffer.len() >= num_channels * (buffer_position + 1) {
+                                            buffer_position * num_channels + channel
+                                        } else {
+                                            // If mono source, use the same sample for all channels
+                                            buffer_position
+                                        };
+
+                                    if buffer_idx < buffer.len() {
+                                        out_buffer[out_idx] = buffer[buffer_idx];
+                                    } else {
+                                        out_buffer[out_idx] = 0.0;
+                                    }
+                                }
+                            }
+                        }
+                        index += 1;
+                    }
+                } else {
+                    // Clear the output buffer if we have no data
+                    for out_sample in out_buffer.iter_mut() {
+                        *out_sample = 0.0;
+                    }
+                }
+            } else {
+                // Clear the output buffer if we can't get a lock
+                for out_sample in out_buffer.iter_mut() {
+                    *out_sample = 0.0;
+                }
+            }
+
+            // Store the updated position
+            sample_index_clone.store(index, Ordering::Relaxed);
+        }) {
             self.stream = Some(stream);
             self.sample_index = sample_index;
             self.is_playing = false;
-            eprintln!("Created new audio stream (paused)");
+            eprintln!(
+                "Created new multi-channel audio stream (paused) with device rate {}Hz",
+                device_sample_rate
+            );
         }
     }
 
     pub fn seek_to(&mut self, position: f32) {
-        if let Some(waveform) = &self.waveform {
-            // Apply trim_start offset to the position
-            let effective_position = self.trim_start + position;
-            let index = (effective_position * waveform.sample_rate as f32) as usize;
-            self.sample_index.store(index, Ordering::Relaxed);
-            self.current_position = position;
-        }
+        // Apply trim_start offset to the position
+        let effective_position = self.trim_start + position;
+        let sample_rate = if let Some(waveform) = &self.waveform {
+            waveform.sample_rate
+        } else {
+            SAMPLE_RATE
+        };
+
+        let frame_position = (effective_position * sample_rate as f32) as usize;
+        self.sample_index.store(frame_position, Ordering::Relaxed);
+        self.current_position = position;
+
+        eprintln!(
+            "Seeked to position {}s (frame {})",
+            effective_position, frame_position
+        );
     }
 
     pub fn play(&mut self) {
         if let Some(stream) = &self.stream {
-            // Start playing at the effective position (including trim_start)
-            let effective_position = self.trim_start + self.current_position;
-            let index = (effective_position
-                * self.waveform.as_ref().map_or(44100, |w| w.sample_rate) as f32)
-                as usize;
-            self.sample_index.store(index, Ordering::Relaxed);
-
             if let Err(e) = stream.play() {
                 eprintln!("Failed to play stream: {}", e);
                 return;
@@ -186,11 +307,12 @@ impl Sample {
             self.is_playing = true;
             eprintln!(
                 "Started playing audio from position {} (effective: {})",
-                self.current_position, effective_position
+                self.current_position,
+                self.trim_start + self.current_position
             );
         } else {
             // Try to recreate the stream if we have an audio file but no stream
-            if self.audio_file.is_some() && self.audio_buffer.lock().is_ok() {
+            if self.audio_file.is_some() {
                 eprintln!("Recreating audio stream for {}", self.name);
                 let audio = Audio::new();
                 self.create_stream(&audio);
@@ -226,9 +348,17 @@ impl Sample {
 
     pub fn load_waveform(&mut self, project_path: Option<&Path>, bpm: Option<f32>) {
         if let Some(path) = &self.audio_file {
-            let path = path.clone();
-            let (samples, sample_rate) = load_audio(&path);
+            // Load the audio data
+            let (samples, sample_rate) = load_audio(path);
             let duration: f32 = samples.len() as f32 / sample_rate as f32;
+            self.total_frames = samples.len();
+
+            // Load samples into the audio buffer
+            if let Ok(mut buffer) = self.audio_buffer.lock() {
+                buffer.clear();
+                buffer.extend_from_slice(&samples);
+                eprintln!("Loaded {} samples into memory", samples.len());
+            }
 
             // Initialize trim_end to the full duration if it's not set
             if self.trim_end == 0.0 {
@@ -251,23 +381,12 @@ impl Sample {
                 duration, effective_duration, self.grid_length
             );
 
+            // Generate downsampled waveform for display
             let downsample_factor = samples.len() / 1000;
             let waveform_samples: Vec<f32> = samples
-                .chunks(downsample_factor)
+                .chunks(downsample_factor.max(1)) // Ensure at least 1
                 .map(|chunk| chunk.iter().map(|&s| s.abs()).fold(0.0, f32::max))
                 .collect();
-
-            if self.audio_buffer.lock().is_err() {
-                self.audio_buffer = Arc::new(Mutex::new(vec![0.0; 1024 * 1024]));
-            }
-
-            if let Ok(mut buffer) = self.audio_buffer.lock() {
-                buffer.clear();
-                buffer.extend_from_slice(&samples);
-                eprintln!("Loaded {} samples into audio buffer", samples.len());
-            } else {
-                eprintln!("Failed to lock audio buffer for writing");
-            }
 
             // Save waveform data if we have a project path
             if let Some(project_path) = project_path {
@@ -463,6 +582,10 @@ pub struct DawState {
     pub last_clicked_bar: f32,
     pub project_name: String,
     pub file_path: Option<PathBuf>,
+    #[serde(default)]
+    pub h_scroll_offset: f32,
+    #[serde(default)]
+    pub v_scroll_offset: f32,
 }
 
 impl Default for DawState {
@@ -486,6 +609,8 @@ impl Default for DawState {
             last_clicked_bar: 0.0,
             project_name: String::new(),
             file_path: None,
+            h_scroll_offset: 0.0,
+            v_scroll_offset: 0.0,
         }
     }
 }
@@ -801,67 +926,6 @@ impl DawApp {
                     track.recording = !track.recording;
                 }
             }
-            DawAction::LoadTrackAudio(track_id, path, _) => {
-                // Create a new sample and add it to the track
-                if let Some(track) = self.state.tracks.iter_mut().find(|t| t.id == track_id) {
-                    let mut sample = Sample::default();
-                    sample.is_playing = false;
-                    sample.current_position = 0.0;
-                    sample.audio_file = Some(path.clone());
-                    sample.name = path
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("Unknown")
-                        .to_string();
-                    sample.load_waveform(None, Some(self.state.bpm));
-
-                    // After loading the waveform, update the grid times based on current BPM
-                    sample.update_grid_times(self.state.bpm);
-
-                    // Initialize trim points
-                    if let Some(waveform) = &sample.waveform {
-                        sample.trim_start = 0.0;
-                        sample.trim_end = waveform.duration;
-                    }
-
-                    // Ensure we create a stream for this sample
-                    sample.create_stream(&self.audio);
-
-                    // Verify stream was created successfully
-                    if sample.stream.is_none() {
-                        eprintln!("Warning: Failed to create audio stream on load");
-                        // Try one more time with a new Audio instance
-                        let audio = Audio::new();
-                        sample.create_stream(&audio);
-                    }
-
-                    // Add the sample to the track
-                    track.add_sample(sample);
-
-                    eprintln!("Loaded audio file: {}", path.display());
-                }
-            }
-            DawAction::SeekTrack(track_id, position) => {
-                if let Some(track) = self.state.tracks.iter_mut().find(|t| t.id == track_id) {
-                    for sample in &mut track.samples {
-                        sample.seek_to(position);
-                    }
-                }
-            }
-            DawAction::PlayTrack(track_id) => {
-                if let Some(track) = self.state.tracks.iter_mut().find(|t| t.id == track_id) {
-                    for sample in &mut track.samples {
-                        sample.play();
-                    }
-                }
-            }
-            DawAction::PauseTrack(track_id) => {
-                if let Some(track) = self.state.tracks.iter_mut().find(|t| t.id == track_id) {
-                    for sample in &mut track.samples {
-                        sample.pause();
-                    }
-                }
-            }
             DawAction::AddSampleToTrack(track_id, path) => {
                 if let Some(track) = self.state.tracks.iter_mut().find(|t| t.id == track_id) {
                     let mut sample = Sample::default();
@@ -894,8 +958,7 @@ impl DawApp {
                                 let other_end = s.grid_position + s.grid_length;
 
                                 // Check if the samples overlap
-                                (current_sample_start < other_end
-                                    && current_sample_end > other_start)
+                                current_sample_start < other_end && current_sample_end > other_start
                             })
                             .map(|s| s.id)
                             .collect();
@@ -941,8 +1004,7 @@ impl DawApp {
                                 let other_end = s.grid_position + s.grid_length;
 
                                 // Check if the samples overlap
-                                (current_sample_start < other_end
-                                    && current_sample_end > other_start)
+                                current_sample_start < other_end && current_sample_end > other_start
                             })
                             .map(|s| s.id)
                             .collect();
@@ -985,8 +1047,7 @@ impl DawApp {
                                 let other_end = s.grid_position + s.grid_length;
 
                                 // Check if the samples overlap
-                                (current_sample_start < other_end
-                                    && current_sample_end > other_start)
+                                current_sample_start < other_end && current_sample_end > other_start
                             })
                             .map(|s| s.id)
                             .collect();
@@ -1016,49 +1077,26 @@ impl DawApp {
                     }
                 }
             }
-            DawAction::SetSampleTrimPoints(track_id, sample_id, start, end) => {
-                if let Some(track) = self.state.tracks.iter_mut().find(|t| t.id == track_id) {
-                    if let Some(sample) = track.get_sample_mut(sample_id) {
-                        sample.set_trim_points(start, end);
-                        sample.update_grid_times(self.state.bpm);
-
-                        // Check for overlaps with other samples after changing trim points
-                        let current_sample_start = sample.grid_position;
-                        let current_sample_end = sample.grid_position + sample.grid_length;
-
-                        // Find samples that might now overlap with this one
-                        let overlapping_samples: Vec<usize> = track
-                            .samples
-                            .iter()
-                            .filter(|s| s.id != sample_id) // Skip the current sample
-                            .filter(|s| {
-                                let other_start = s.grid_position;
-                                let other_end = s.grid_position + s.grid_length;
-
-                                // Check if the samples overlap
-                                (current_sample_start < other_end
-                                    && current_sample_end > other_start)
-                            })
-                            .map(|s| s.id)
-                            .collect();
-
-                        // Adjust the length of overlapping samples
-                        for overlap_id in overlapping_samples {
-                            if let Some(other_sample) = track.get_sample_mut(overlap_id) {
-                                // If this is a sample that starts before our current sample
-                                if other_sample.grid_position < current_sample_start {
-                                    // Adjust its length to end exactly at the start of our current sample
-                                    let new_length =
-                                        current_sample_start - other_sample.grid_position;
-                                    eprintln!("Adjusting sample {} length from {} to {} due to overlap with sample {}", 
-                                            other_sample.id, other_sample.grid_length, new_length, sample_id);
-                                    other_sample.grid_length = new_length;
-                                    other_sample.update_grid_times(self.state.bpm);
-                                }
-                            }
-                        }
+            DawAction::SetSampleTrimPoints(track_id, sample_id, trim_start, trim_end) => {
+                if let Some(track) = self
+                    .state
+                    .tracks
+                    .iter_mut()
+                    .find(|track| track.id == track_id)
+                {
+                    if let Some(sample) = track
+                        .samples
+                        .iter_mut()
+                        .find(|sample| sample.id == sample_id)
+                    {
+                        sample.trim_start = trim_start;
+                        sample.trim_end = trim_end;
                     }
                 }
+            }
+            DawAction::UpdateScrollPosition(h_scroll, v_scroll) => {
+                self.state.h_scroll_offset = h_scroll;
+                self.state.v_scroll_offset = v_scroll;
             }
         }
     }
@@ -1200,41 +1238,6 @@ impl DawApp {
         }
     }
 
-    // Calculate if a sample should be playing at the current timeline position
-    pub fn should_sample_play(&self, track_id: usize, sample_id: usize) -> bool {
-        if let Some(track) = self.state.tracks.iter().find(|t| t.id == track_id) {
-            if let Some(sample) = track.samples.iter().find(|s| s.id == sample_id) {
-                // Add a small epsilon to avoid floating-point precision issues
-                const EPSILON: f32 = 0.0001;
-                self.state.timeline_position + EPSILON >= sample.grid_start_time
-                    && self.state.timeline_position < sample.grid_end_time
-            } else {
-                false
-            }
-        } else {
-            false
-        }
-    }
-
-    // Calculate the relative position within a sample based on the timeline position
-    pub fn sample_relative_position(&self, track_id: usize, sample_id: usize) -> Option<f32> {
-        if let Some(track) = self.state.tracks.iter().find(|t| t.id == track_id) {
-            if let Some(sample) = track.samples.iter().find(|s| s.id == sample_id) {
-                if self.should_sample_play(track_id, sample_id) {
-                    // Round to 6 decimal places to avoid floating-point precision issues
-                    let relative_position = self.state.timeline_position - sample.grid_start_time;
-                    Some((relative_position * 1000000.0).round() / 1000000.0)
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        }
-    }
-
     #[cfg(test)]
     pub fn new_test() -> Self {
         let bpm = 120.0;
@@ -1249,6 +1252,8 @@ impl DawApp {
                 last_clicked_bar: 0.0,
                 project_name: "Test Project".to_string(),
                 file_path: None,
+                h_scroll_offset: 0.0,
+                v_scroll_offset: 0.0,
             },
             audio: Audio::new(),
             last_update: std::time::Instant::now(),

@@ -1,7 +1,6 @@
 mod audio;
 mod config;
 mod daw;
-mod daw_state;
 mod ui;
 
 use daw::DawApp;
