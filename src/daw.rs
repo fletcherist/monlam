@@ -2,6 +2,7 @@ use crate::audio::{load_audio, Audio};
 use crate::config::{load_waveform_data, save_waveform_data, WaveformData};
 use cpal::traits::StreamTrait;
 use rfd::FileDialog;
+use rfd::MessageDialog;
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs;
@@ -165,16 +166,24 @@ impl Sample {
             if buffer.is_empty() && self.audio_file.is_some() {
                 drop(buffer); // Release the lock before loading audio
                 if let Some(path) = &self.audio_file {
-                    let (samples, sample_rate) = load_audio(path);
-                    if let Ok(mut buffer) = self.audio_buffer.lock() {
-                        buffer.clear();
-                        buffer.extend_from_slice(&samples);
-                        self.total_frames = samples.len();
-                        eprintln!(
-                            "Loaded {} samples into memory at {}Hz",
-                            samples.len(),
-                            sample_rate
-                        );
+                    match load_audio(path) {
+                        Ok((samples, sample_rate)) => {
+                            if let Ok(mut buffer) = self.audio_buffer.lock() {
+                                buffer.clear();
+                                buffer.extend_from_slice(&samples);
+                                self.total_frames = samples.len();
+                                eprintln!(
+                                    "Loaded {} samples into memory at {}Hz",
+                                    samples.len(),
+                                    sample_rate
+                                );
+                            }
+                        }
+                        Err(err) => {
+                            // Just log the error but don't show a dialog since that's handled elsewhere
+                            eprintln!("Failed to load audio in create_stream: {}", err);
+                            return; // Exit early if we can't load the audio
+                        }
                     }
                 }
             }
@@ -361,65 +370,72 @@ impl Sample {
     pub fn load_waveform(&mut self, project_path: Option<&Path>, bpm: Option<f32>) {
         if let Some(path) = &self.audio_file {
             // Load the audio data
-            let (samples, sample_rate) = load_audio(path);
-            let duration: f32 = samples.len() as f32 / sample_rate as f32;
-            self.total_frames = samples.len();
+            match load_audio(path) {
+                Ok((samples, sample_rate)) => {
+                    let duration: f32 = samples.len() as f32 / sample_rate as f32;
+                    self.total_frames = samples.len();
 
-            // Load samples into the audio buffer
-            if let Ok(mut buffer) = self.audio_buffer.lock() {
-                buffer.clear();
-                buffer.extend_from_slice(&samples);
-                eprintln!("Loaded {} samples into memory", samples.len());
-            }
+                    // Load samples into the audio buffer
+                    if let Ok(mut buffer) = self.audio_buffer.lock() {
+                        buffer.clear();
+                        buffer.extend_from_slice(&samples);
+                        eprintln!("Loaded {} samples into memory", samples.len());
+                    }
 
-            // Initialize trim_end to the full duration if it's not set
-            if self.trim_end == 0.0 {
-                self.trim_end = duration;
-            }
+                    // Initialize trim_end to the full duration if it's not set
+                    if self.trim_end == 0.0 {
+                        self.trim_end = duration;
+                    }
 
-            // Calculate grid length based on the trimmed duration
-            let beats_per_second = bpm.unwrap_or(120.0) / 60.0;
-            let effective_duration = if self.trim_end <= 0.0 {
-                duration - self.trim_start
-            } else {
-                self.trim_end - self.trim_start
-            };
+                    // Calculate grid length based on the trimmed duration
+                    let beats_per_second = bpm.unwrap_or(120.0) / 60.0;
+                    let effective_duration = if self.trim_end <= 0.0 {
+                        duration - self.trim_start
+                    } else {
+                        self.trim_end - self.trim_start
+                    };
 
-            // Calculate grid length based on the trimmed duration
-            self.grid_length = effective_duration * beats_per_second * 0.5;
+                    // Calculate grid length based on the trimmed duration
+                    self.grid_length = effective_duration * beats_per_second * 0.5;
 
-            eprintln!(
-                "Sample loaded with duration: {:.2}s, effective duration: {:.2}s, grid_length (beats): {:.2}",
-                duration, effective_duration, self.grid_length
-            );
+                    eprintln!(
+                        "Sample loaded with duration: {:.2}s, effective duration: {:.2}s, grid_length (beats): {:.2}",
+                        duration, effective_duration, self.grid_length
+                    );
 
-            // Generate downsampled waveform for display
-            let downsample_factor = samples.len() / 1000;
-            let waveform_samples: Vec<f32> = samples
-                .chunks(downsample_factor.max(1)) // Ensure at least 1
-                .map(|chunk| chunk.iter().map(|&s| s.abs()).fold(0.0, f32::max))
-                .collect();
+                    // Generate downsampled waveform for display
+                    let downsample_factor = samples.len() / 1000;
+                    let waveform_samples: Vec<f32> = samples
+                        .chunks(downsample_factor.max(1)) // Ensure at least 1
+                        .map(|chunk| chunk.iter().map(|&s| s.abs()).fold(0.0, f32::max))
+                        .collect();
 
-            // Save waveform data if we have a project path
-            if let Some(project_path) = project_path {
-                let waveform_data = WaveformData {
-                    samples: waveform_samples.clone(),
-                    sample_rate,
-                    duration,
-                };
-                if let Some(waveform_path) =
-                    save_waveform_data(project_path, &self.name, &waveform_data)
-                {
-                    self.waveform_file = Some(waveform_path.clone());
-                    eprintln!("Saved waveform data to {}", waveform_path.display());
+                    // Save waveform data if we have a project path
+                    if let Some(project_path) = project_path {
+                        let waveform_data = WaveformData {
+                            samples: waveform_samples.clone(),
+                            sample_rate,
+                            duration,
+                        };
+                        if let Some(waveform_path) =
+                            save_waveform_data(project_path, &self.name, &waveform_data)
+                        {
+                            self.waveform_file = Some(waveform_path.clone());
+                            eprintln!("Saved waveform data to {}", waveform_path.display());
+                        }
+                    }
+
+                    self.waveform = Some(SampleWaveform {
+                        samples: waveform_samples,
+                        sample_rate,
+                        duration,
+                    });
+                }
+                Err(err) => {
+                    // Just log the error but don't show a dialog since that's handled elsewhere
+                    eprintln!("Failed to load audio in load_waveform: {}", err);
                 }
             }
-
-            self.waveform = Some(SampleWaveform {
-                samples: waveform_samples,
-                sample_rate,
-                duration,
-            });
         } else if let Some(waveform_path) = &self.waveform_file {
             // Try to load waveform data from file
             if let Some(waveform_data) = load_waveform_data(waveform_path) {
@@ -960,52 +976,86 @@ impl DawApp {
                         .and_then(|n| n.to_str())
                         .unwrap_or("Unknown")
                         .to_string();
-                    sample.load_waveform(None, Some(self.state.bpm));
-                    sample.update_grid_times(self.state.bpm);
-                    sample.create_stream(&self.audio);
 
-                    // Add the sample to the track
-                    track.add_sample(sample);
-                    let new_sample_id = track.samples.last().map(|s| s.id).unwrap_or(0);
+                    // Try to load the audio file first
+                    if let Some(path_ref) = &sample.audio_file {
+                        match load_audio(path_ref) {
+                            Ok((samples, sample_rate)) => {
+                                // Only initialize the sample if loading succeeded
+                                let duration: f32 = samples.len() as f32 / sample_rate as f32;
+                                sample.total_frames = samples.len();
 
-                    // Now check for and adjust any overlapping samples
-                    if let Some(new_sample) = track.get_sample(new_sample_id) {
-                        let current_sample_start = new_sample.grid_position;
-                        let current_sample_end = new_sample.grid_position + new_sample.grid_length;
-
-                        // Find overlapping samples
-                        let overlapping_samples: Vec<usize> = track
-                            .samples
-                            .iter()
-                            .filter(|s| s.id != new_sample_id) // Skip the newly added sample
-                            .filter(|s| {
-                                let other_start = s.grid_position;
-                                let other_end = s.grid_position + s.grid_length;
-
-                                // Check if the samples overlap
-                                current_sample_start < other_end && current_sample_end > other_start
-                            })
-                            .map(|s| s.id)
-                            .collect();
-
-                        // Adjust the length of overlapping samples
-                        for overlap_id in overlapping_samples {
-                            if let Some(other_sample) = track.get_sample_mut(overlap_id) {
-                                // If this is a sample that starts before our new sample
-                                if other_sample.grid_position < current_sample_start {
-                                    // Adjust its length to end exactly at the start of our new sample
-                                    let new_length =
-                                        current_sample_start - other_sample.grid_position;
-                                    eprintln!("Adjusting sample {} length from {} to {} due to overlap with new sample {}", 
-                                              other_sample.id, other_sample.grid_length, new_length, new_sample_id);
-                                    other_sample.grid_length = new_length;
-                                    other_sample.update_grid_times(self.state.bpm);
+                                // Load samples into the audio buffer
+                                if let Ok(mut buffer) = sample.audio_buffer.lock() {
+                                    buffer.clear();
+                                    buffer.extend_from_slice(&samples);
                                 }
+
+                                // Initialize waveform and create stream
+                                sample.load_waveform(None, Some(self.state.bpm));
+                                sample.update_grid_times(self.state.bpm);
+                                sample.create_stream(&self.audio);
+
+                                // Add the sample to the track only if loading succeeded
+                                track.add_sample(sample);
+                                let new_sample_id = track.samples.last().map(|s| s.id).unwrap_or(0);
+
+                                // Handle overlapping samples
+                                if let Some(new_sample) = track.get_sample(new_sample_id) {
+                                    let current_sample_start = new_sample.grid_position;
+                                    let current_sample_end =
+                                        new_sample.grid_position + new_sample.grid_length;
+
+                                    // Find overlapping samples
+                                    let overlapping_samples: Vec<usize> = track
+                                        .samples
+                                        .iter()
+                                        .filter(|s| s.id != new_sample_id) // Skip the newly added sample
+                                        .filter(|s| {
+                                            let other_start = s.grid_position;
+                                            let other_end = s.grid_position + s.grid_length;
+
+                                            // Check if the samples overlap
+                                            current_sample_start < other_end
+                                                && current_sample_end > other_start
+                                        })
+                                        .map(|s| s.id)
+                                        .collect();
+
+                                    // Adjust the length of overlapping samples
+                                    for overlap_id in overlapping_samples {
+                                        if let Some(other_sample) = track.get_sample_mut(overlap_id)
+                                        {
+                                            // If this is a sample that starts before our new sample
+                                            if other_sample.grid_position < current_sample_start {
+                                                // Adjust its length to end exactly at the start of our new sample
+                                                let new_length = current_sample_start
+                                                    - other_sample.grid_position;
+                                                eprintln!("Adjusting sample {} length from {} to {} due to overlap with new sample {}", 
+                                                         other_sample.id, other_sample.grid_length, new_length, new_sample_id);
+                                                other_sample.grid_length = new_length;
+                                                other_sample.update_grid_times(self.state.bpm);
+                                            }
+                                        }
+                                    }
+                                }
+
+                                eprintln!(
+                                    "Added sample to track {}: {}",
+                                    track.name,
+                                    path.display()
+                                );
+                            }
+                            Err(err) => {
+                                eprintln!("Failed to add sample to track: {}", err);
+                                // Show error message dialog
+                                MessageDialog::new()
+                                    .set_title("Audio Error")
+                                    .set_description(&err.to_string())
+                                    .show();
                             }
                         }
                     }
-
-                    eprintln!("Added sample to track {}: {}", track.name, path.display());
                 }
             }
             DawAction::MoveSample(track_id, sample_id, new_position) => {
