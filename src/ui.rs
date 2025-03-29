@@ -33,6 +33,8 @@ struct TransportControls<'a> {
     on_save: &'a mut dyn FnMut(),
     on_load: &'a mut dyn FnMut(),
     on_render: &'a mut dyn FnMut(),
+    loop_enabled: bool,
+    on_toggle_loop: &'a mut dyn FnMut(),
 }
 
 impl<'a> TransportControls<'a> {
@@ -65,6 +67,24 @@ impl<'a> TransportControls<'a> {
                 .clicked()
             {
                 (self.on_forward)();
+            }
+
+            // Make loop indicator clickable to toggle loop mode
+            let loop_text = RichText::new("🔄 LOOP").size(14.0);
+            let loop_button = if self.loop_enabled {
+                ui.add(egui::Button::new(
+                    loop_text.color(Color32::from_rgb(255, 100, 100)),
+                ))
+                .on_hover_text("Click to disable loop mode")
+            } else {
+                ui.add(egui::Button::new(
+                    loop_text.color(Color32::from_rgb(100, 100, 100)),
+                ))
+                .on_hover_text("Click to enable loop mode (requires selection)")
+            };
+
+            if loop_button.clicked() {
+                (self.on_toggle_loop)();
             }
 
             ui.add_space(16.0);
@@ -239,6 +259,7 @@ struct Grid<'a> {
     v_scroll_offset: f32,                                // Vertical scroll offset in pixels
     selection: Option<SelectionRect>,
     on_selection_change: &'a mut dyn FnMut(Option<SelectionRect>),
+    loop_enabled: bool,
 }
 
 impl<'a> Grid<'a> {
@@ -813,19 +834,26 @@ impl<'a> Grid<'a> {
                 egui::Pos2::new(end_x, end_y),
             );
 
+            // Choose colors based on whether looping is enabled
+            let (fill_color, stroke_color) = if self.loop_enabled {
+                // Brighter colors for loop-enabled state
+                (
+                    Color32::from_rgba_premultiplied(255, 100, 100, 80), // Red-tinted, more visible
+                    Color32::from_rgb(255, 100, 100),                    // Red border
+                )
+            } else {
+                // Default colors for normal selection
+                (
+                    Color32::from_rgba_premultiplied(100, 150, 255, 64), // Light blue, semi-transparent
+                    Color32::from_rgb(100, 150, 255),                    // Light blue border
+                )
+            };
+
             // Draw semi-transparent fill
-            painter.rect_filled(
-                selection_rect,
-                0.0,
-                Color32::from_rgba_premultiplied(100, 150, 255, 64), // Light blue, semi-transparent
-            );
+            painter.rect_filled(selection_rect, 0.0, fill_color);
 
             // Draw border
-            painter.rect_stroke(
-                selection_rect,
-                0.0,
-                Stroke::new(2.0, Color32::from_rgb(100, 150, 255)), // Light blue border
-            );
+            painter.rect_stroke(selection_rect, 0.0, Stroke::new(2.0, stroke_color));
         }
 
         // Draw playhead adjusted for horizontal scroll
@@ -1130,6 +1158,21 @@ impl eframe::App for DawApp {
             self.dispatch(DawAction::TogglePlayback);
         }
 
+        // Handle Cmd+L to toggle loop with current selection
+        if ctx.input(|i| i.key_pressed(Key::L) && i.modifiers.command) {
+            // Only enable looping if there's a selection
+            if self.state.selection.is_some() {
+                self.dispatch(DawAction::ToggleLoopSelection);
+
+                // If we're enabling looping and playback is active, set the timeline position to the start of the selection
+                if self.state.loop_enabled && self.state.is_playing {
+                    let selection = self.state.selection.as_ref().unwrap();
+                    let loop_start = selection.start_beat * (60.0 / self.state.bpm);
+                    self.dispatch(DawAction::SetTimelinePosition(loop_start));
+                }
+            }
+        }
+
         // Update timeline position based on audio playback
         self.update_playback();
 
@@ -1269,6 +1312,7 @@ impl eframe::App for DawApp {
                 v_scroll: f32,
             },
             SetSelection(Option<SelectionRect>),
+            ToggleLoopSelection,
         }
 
         // Collect actions during UI rendering using Rc<RefCell>
@@ -1325,6 +1369,12 @@ impl eframe::App for DawApp {
                 },
                 on_render: &mut || {
                     actions_clone.borrow_mut().push(UiAction::RenderSelection);
+                },
+                loop_enabled: self.state.loop_enabled,
+                on_toggle_loop: &mut || {
+                    actions_clone
+                        .borrow_mut()
+                        .push(UiAction::ToggleLoopSelection);
                 },
             }
             .draw(ui);
@@ -1390,6 +1440,7 @@ impl eframe::App for DawApp {
                             .borrow_mut()
                             .push(UiAction::SetSelection(new_selection));
                     },
+                    loop_enabled: self.state.loop_enabled,
                 };
                 grid.draw(ui);
 
@@ -1565,6 +1616,19 @@ impl eframe::App for DawApp {
                 }
                 UiAction::SetSelection(selection) => {
                     self.dispatch(DawAction::SetSelection(selection.clone()));
+                }
+                UiAction::ToggleLoopSelection => {
+                    // Only toggle loop if there's a selection
+                    if self.state.selection.is_some() {
+                        self.dispatch(DawAction::ToggleLoopSelection);
+
+                        // If we're enabling looping and playback is active, set the timeline position to the start of the selection
+                        if self.state.loop_enabled && self.state.is_playing {
+                            let selection = self.state.selection.as_ref().unwrap();
+                            let loop_start = selection.start_beat * (60.0 / self.state.bpm);
+                            self.dispatch(DawAction::SetTimelinePosition(loop_start));
+                        }
+                    }
                 }
             }
         }

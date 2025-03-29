@@ -42,6 +42,7 @@ pub enum DawAction {
     SetSampleTrimPoints(usize, usize, f32, f32), // track_id, sample_id, start, end
     UpdateScrollPosition(f32, f32), // h_scroll, v_scroll
     SetSelection(Option<SelectionRect>), // Use Option<SelectionRect>
+    ToggleLoopSelection,           // Toggle looping within the current selection
     RenderSelection(PathBuf),      // Path to save the rendered WAV file
 }
 
@@ -597,6 +598,8 @@ pub struct DawState {
     pub v_scroll_offset: f32,
     #[serde(default)]
     pub selection: Option<SelectionRect>, // Use Option<SelectionRect>
+    #[serde(default)]
+    pub loop_enabled: bool, // Whether looping is enabled for the current selection
 }
 
 impl Default for DawState {
@@ -623,6 +626,7 @@ impl Default for DawState {
             h_scroll_offset: 0.0,
             v_scroll_offset: 0.0,
             selection: None,
+            loop_enabled: false,
         }
     }
 }
@@ -1117,6 +1121,9 @@ impl DawApp {
                     // State already matched
                 }
             }
+            DawAction::ToggleLoopSelection => {
+                self.state.loop_enabled = !self.state.loop_enabled;
+            }
             DawAction::RenderSelection(path) => {
                 if let Some(selection) = &self.state.selection {
                     self.render_selection(&path, selection);
@@ -1158,6 +1165,27 @@ impl DawApp {
 
             // Update timeline position
             self.state.timeline_position += delta;
+
+            // Handle looping within selection if enabled
+            if self.state.loop_enabled && self.state.selection.is_some() {
+                let selection = self.state.selection.as_ref().unwrap();
+                // Convert selection beats to time
+                let loop_start = selection.start_beat * (60.0 / self.state.bpm);
+                let loop_end = selection.end_beat * (60.0 / self.state.bpm);
+
+                // If we've passed the end of the selection, loop back to the start
+                if self.state.timeline_position >= loop_end {
+                    eprintln!("Looping back to selection start");
+                    self.state.timeline_position = loop_start;
+
+                    // Reset playback state for all samples
+                    for track in &mut self.state.tracks {
+                        for sample in &mut track.samples {
+                            sample.reset_playback();
+                        }
+                    }
+                }
+            }
 
             let timeline_pos = self.state.timeline_position;
             let mut any_sample_playing = false;
@@ -1204,7 +1232,7 @@ impl DawApp {
             }
 
             // Check if we've reached the end of all samples
-            if !any_sample_playing {
+            if !any_sample_playing && !self.state.loop_enabled {
                 let all_samples_past = self.state.tracks.iter().all(|track| {
                     track
                         .samples
@@ -1260,6 +1288,7 @@ impl DawApp {
                 h_scroll_offset: 0.0,
                 v_scroll_offset: 0.0,
                 selection: None,
+                loop_enabled: false,
             },
             audio: Audio::new(),
             last_update: std::time::Instant::now(),
