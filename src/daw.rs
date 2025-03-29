@@ -3,15 +3,22 @@ use crate::config::{load_waveform_data, save_waveform_data, WaveformData};
 use cpal::traits::StreamTrait;
 use rfd::FileDialog;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::env;
 use std::fs;
-use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+
+// --- Define SelectionRect Struct HERE ---
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SelectionRect {
+    pub start_track_idx: usize,
+    pub start_beat: f32,
+    pub end_track_idx: usize, // Inclusive index
+    pub end_beat: f32,
+}
+// --- End SelectionRect Definition ---
 
 // DAW Action enum for state management
 #[derive(Debug, Clone)]
@@ -34,6 +41,7 @@ pub enum DawAction {
     DeleteSample(usize, usize),    // track_id, sample_id
     SetSampleTrimPoints(usize, usize, f32, f32), // track_id, sample_id, start, end
     UpdateScrollPosition(f32, f32), // h_scroll, v_scroll
+    SetSelection(Option<SelectionRect>), // Use Option<SelectionRect>
 }
 
 const BUFFER_SIZE: usize = 1024;
@@ -586,6 +594,8 @@ pub struct DawState {
     pub h_scroll_offset: f32,
     #[serde(default)]
     pub v_scroll_offset: f32,
+    #[serde(default)]
+    pub selection: Option<SelectionRect>, // Use Option<SelectionRect>
 }
 
 impl Default for DawState {
@@ -611,6 +621,7 @@ impl Default for DawState {
             file_path: None,
             h_scroll_offset: 0.0,
             v_scroll_offset: 0.0,
+            selection: None,
         }
     }
 }
@@ -1098,6 +1109,13 @@ impl DawApp {
                 self.state.h_scroll_offset = h_scroll;
                 self.state.v_scroll_offset = v_scroll;
             }
+            DawAction::SetSelection(selection) => {
+                if self.state.selection != selection {
+                    self.state.selection = selection;
+                } else {
+                    // State already matched
+                }
+            }
         }
     }
 
@@ -1133,30 +1151,18 @@ impl DawApp {
             // Update timeline position
             self.state.timeline_position += delta;
 
-            // First collect sample info for all tracks
             let timeline_pos = self.state.timeline_position;
             let mut any_sample_playing = false;
 
-            // Check for soloed tracks before mutable borrowing
             let any_track_soloed = self.state.tracks.iter().any(|t| t.soloed);
 
             for track in &mut self.state.tracks {
-                // Skip muted tracks
-                if track.muted {
+                if track.muted || (any_track_soloed && !track.soloed) {
                     continue;
                 }
 
-                // Handle the soloing logic
-                if any_track_soloed && !track.soloed {
-                    // If any track is soloed and this one isn't, skip it
-                    continue;
-                }
-
-                // Since we're now handling overlaps by adjusting sample lengths,
-                // we don't need special overlap detection during playback
                 for sample in &mut track.samples {
                     sample.update_grid_times(self.state.bpm);
-
                     let should_play = timeline_pos >= sample.grid_start_time
                         && timeline_pos < sample.grid_end_time;
 
@@ -1166,23 +1172,14 @@ impl DawApp {
                             sample.seek_to(relative_position);
                             sample.play();
                         }
-
                         let relative_position = timeline_pos - sample.grid_start_time;
                         sample.current_position = relative_position;
 
-                        // Check if we've reached the trim_end point
-                        if let Some(waveform) = &sample.waveform {
-                            // Calculate the position within the actual audio file
+                        if let Some(_waveform) = &sample.waveform {
                             let effective_position = sample.trim_start + relative_position;
-
-                            // If trim_end is set (> 0) and we've reached it, pause playback
                             if sample.trim_end > 0.0 && effective_position >= sample.trim_end {
                                 if sample.is_playing {
                                     sample.pause();
-                                    eprintln!(
-                                        "Reached trim end point at {}s for sample {}",
-                                        sample.trim_end, sample.name
-                                    );
                                 }
                             } else {
                                 any_sample_playing = true;
@@ -1254,6 +1251,7 @@ impl DawApp {
                 file_path: None,
                 h_scroll_offset: 0.0,
                 v_scroll_offset: 0.0,
+                selection: None,
             },
             audio: Audio::new(),
             last_update: std::time::Instant::now(),

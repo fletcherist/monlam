@@ -1,10 +1,10 @@
-use crate::daw::{DawAction, DawApp};
+use crate::daw::{DawAction, DawApp, SelectionRect};
 use eframe::egui;
 use egui::{Color32, Key, RichText, Stroke};
 use rfd::FileDialog;
 use std::cell::RefCell;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::mpsc::channel;
 
 // UI Constants
 const TIMELINE_HEIGHT: f32 = 60.0;
@@ -226,16 +226,37 @@ struct Grid<'a> {
     on_track_record: &'a mut dyn FnMut(usize),           // track_id
     h_scroll_offset: f32,                                // Horizontal scroll offset in seconds
     v_scroll_offset: f32,                                // Vertical scroll offset in pixels
+    selection: Option<SelectionRect>,
+    on_selection_change: &'a mut dyn FnMut(Option<SelectionRect>),
 }
 
 impl<'a> Grid<'a> {
     fn draw(&mut self, ui: &mut egui::Ui) {
+        // Declare selection_drag_start using ui.memory_mut, storing Option<(usize, f32)> directly
+        let mut selection_drag_start = ui.memory_mut(|mem| {
+            mem.data
+                .get_persisted_mut_or_insert_with(ui.id().with("selection_drag_start"), || {
+                    None::<(usize, f32)> // Store Option directly, not RefCell<Option<...>>
+                })
+                .clone() // Clone the Option<(usize, f32)>
+        });
+
+        // Create local copies of scroll offsets to avoid borrowing issues
+        let mut h_scroll_offset = self.h_scroll_offset;
+        let mut v_scroll_offset = self.v_scroll_offset;
+
+        // Track if we've clicked on a sample to prevent duplicate selection
+        let mut clicked_on_sample_in_track = false;
+
         let available_width = ui.available_width();
         let available_height = ui.available_height().min(500.0); // Limit max height
 
         // Calculate grid height based on number of tracks
         let total_grid_height = TRACK_HEIGHT * self.tracks.len() as f32
             + TRACK_SPACING * (self.tracks.len() as f32 - 1.0);
+
+        // Capture tracks.len() for use in closures
+        let tracks_len = self.tracks.len();
 
         // Determine if scrollbars are needed
         let need_v_scroll = total_grid_height > available_height;
@@ -279,22 +300,59 @@ impl<'a> Grid<'a> {
             egui::Sense::click_and_drag(),
         );
 
+        // --- Define Coordinate Helper Functions HERE (Moved Earlier) ---
+        let screen_x_to_beat = move |screen_x: f32| -> f32 {
+            let x_relative_to_grid = screen_x - grid_rect.left();
+            let seconds_offset = x_relative_to_grid * seconds_per_pixel;
+            let total_seconds = h_scroll_offset + seconds_offset;
+            total_seconds * beats_per_second
+        };
+
+        let screen_y_to_track_index = move |screen_y: f32| -> Option<usize> {
+            let y_relative_to_grid = screen_y - grid_rect.top();
+            if y_relative_to_grid < 0.0 {
+                return None; // Clicked above the grid
+            }
+            let scrolled_y = v_scroll_offset + y_relative_to_grid;
+            let track_index_f = scrolled_y / (TRACK_HEIGHT + TRACK_SPACING);
+            let track_index = track_index_f.floor() as usize;
+
+            if track_index < tracks_len {
+                Some(track_index)
+            } else {
+                None // Clicked below the last track
+            }
+        };
+
+        // Define a local snap_to_grid function
+        let snap_to_grid = |beat: f32| -> f32 {
+            let division = self.grid_division;
+            let lower_grid_line = (beat / division).floor() * division;
+            let upper_grid_line = (beat / division).ceil() * division;
+
+            // Find which grid line is closer
+            if (beat - lower_grid_line) < (upper_grid_line - beat) {
+                lower_grid_line
+            } else {
+                upper_grid_line
+            }
+        };
+        // --- End Coordinate Helper Functions ---
+
         // Handle pan gesture for grid
         if grid_response.dragged_by(egui::PointerButton::Middle) {
             let delta = grid_response.drag_delta();
             // Convert pixel delta to seconds for horizontal scroll
-            self.h_scroll_offset -= delta.x * seconds_per_pixel;
+            h_scroll_offset -= delta.x * seconds_per_pixel;
             // Constrain horizontal scroll
-            self.h_scroll_offset = self
-                .h_scroll_offset
+            h_scroll_offset = h_scroll_offset
                 .max(0.0)
                 .min(total_duration - num_visible_seconds);
 
             // Vertical scroll offset directly in pixels
-            self.v_scroll_offset -= delta.y;
+            v_scroll_offset -= delta.y;
             // Constrain vertical scroll
-            self.v_scroll_offset = self
-                .v_scroll_offset
+            v_scroll_offset = v_scroll_offset
                 .max(0.0)
                 .min((total_grid_height - visible_height).max(0.0));
         }
@@ -305,13 +363,13 @@ impl<'a> Grid<'a> {
         painter.rect_filled(grid_rect, 0.0, GRID_BACKGROUND);
 
         // Draw grid lines accounting for horizontal scroll
-        let h_scroll_pixels = self.h_scroll_offset / seconds_per_pixel;
-        let first_visible_beat = (self.h_scroll_offset * beats_per_second).floor() as i32;
+        let h_scroll_pixels = h_scroll_offset / seconds_per_pixel;
+        let first_visible_beat = (h_scroll_offset * beats_per_second).floor() as i32;
         let last_visible_beat = (first_visible_beat as f32 + num_visible_beats).ceil() as i32;
 
         for beat in first_visible_beat..last_visible_beat {
             let beat_pos = beat as f32 / beats_per_second;
-            let x = grid_rect.left() + (beat_pos - self.h_scroll_offset) / seconds_per_pixel;
+            let x = grid_rect.left() + (beat_pos - h_scroll_offset) / seconds_per_pixel;
             let color = if beat % 4 == 0 {
                 BAR_LINE_COLOR
             } else {
@@ -343,10 +401,9 @@ impl<'a> Grid<'a> {
 
         // Draw tracks and samples
         let visible_track_start =
-            (self.v_scroll_offset / (TRACK_HEIGHT + TRACK_SPACING)).floor() as usize;
-        let visible_track_end = ((self.v_scroll_offset + visible_height)
-            / (TRACK_HEIGHT + TRACK_SPACING))
-            .ceil() as usize;
+            (v_scroll_offset / (TRACK_HEIGHT + TRACK_SPACING)).floor() as usize;
+        let visible_track_end =
+            ((v_scroll_offset + visible_height) / (TRACK_HEIGHT + TRACK_SPACING)).ceil() as usize;
         let visible_track_end = visible_track_end.min(self.tracks.len());
 
         // Only draw visible tracks
@@ -358,7 +415,7 @@ impl<'a> Grid<'a> {
             .take(visible_track_end - visible_track_start)
         {
             let track_top = grid_rect.top() + track_idx as f32 * (TRACK_HEIGHT + TRACK_SPACING)
-                - self.v_scroll_offset;
+                - v_scroll_offset;
             let track_bottom = track_top + TRACK_HEIGHT;
 
             // Skip tracks that are completely outside the visible area
@@ -515,15 +572,15 @@ impl<'a> Grid<'a> {
                     let seconds_position = beats_position / beats_per_second;
 
                     // Skip samples that are not visible due to horizontal scrolling
-                    if seconds_position + (*length / beats_per_second) < self.h_scroll_offset
-                        || seconds_position > self.h_scroll_offset + num_visible_seconds
+                    if seconds_position + (*length / beats_per_second) < h_scroll_offset
+                        || seconds_position > h_scroll_offset + num_visible_seconds
                     {
                         continue;
                     }
 
                     // Calculate visible region
-                    let region_left = grid_rect.left()
-                        + (seconds_position - self.h_scroll_offset) / seconds_per_pixel;
+                    let region_left =
+                        grid_rect.left() + (seconds_position - h_scroll_offset) / seconds_per_pixel;
                     let region_width = (*length / beats_per_second) / seconds_per_pixel;
 
                     // Clip to visible area
@@ -613,7 +670,19 @@ impl<'a> Grid<'a> {
                     let id = ui
                         .id()
                         .with(format!("track_{}_sample_{}", track_id, sample_id));
-                    let region_response = ui.interact(region_rect, id, egui::Sense::drag());
+                    let region_response =
+                        ui.interact(region_rect, id, egui::Sense::click_and_drag());
+
+                    if region_response.clicked() {
+                        let selection = SelectionRect {
+                            start_track_idx: track_idx,
+                            start_beat: snap_to_grid(*position),
+                            end_track_idx: track_idx,
+                            end_beat: snap_to_grid(*position + *length),
+                        };
+                        (self.on_selection_change)(Some(selection));
+                        clicked_on_sample_in_track = true;
+                    }
 
                     if region_response.dragged() {
                         let delta = region_response.drag_delta().x;
@@ -626,9 +695,131 @@ impl<'a> Grid<'a> {
             }
         }
 
+        // --- Handle Grid Background Interaction for Selection ---
+        if !clicked_on_sample_in_track {
+            if grid_response.drag_started_by(egui::PointerButton::Primary) {
+                if let Some(pointer_pos) = grid_response.interact_pointer_pos() {
+                    if let Some(start_track_idx) = screen_y_to_track_index(pointer_pos.y) {
+                        let raw_start_beat = screen_x_to_beat(pointer_pos.x);
+                        let start_beat = snap_to_grid(raw_start_beat); // Snap to grid
+
+                        // Update the stored value directly using get_persisted_mut_or_default
+                        ui.memory_mut(|mem| {
+                            *mem.data
+                                .get_persisted_mut_or_default::<Option<(usize, f32)>>(
+                                    ui.id().with("selection_drag_start"),
+                                ) = Some((start_track_idx, start_beat));
+                        });
+                        selection_drag_start = Some((start_track_idx, start_beat)); // Update local copy
+                        (self.on_selection_change)(None); // Clear visual selection on drag start
+                    }
+                }
+            }
+
+            if grid_response.dragged_by(egui::PointerButton::Primary) {
+                if let (Some((start_idx, start_beat)), Some(current_pos)) = (
+                    selection_drag_start, // Use the local copy
+                    grid_response.interact_pointer_pos(),
+                ) {
+                    if let Some(current_idx) = screen_y_to_track_index(current_pos.y) {
+                        let raw_current_beat = screen_x_to_beat(current_pos.x);
+                        let current_beat = snap_to_grid(raw_current_beat); // Snap to grid
+
+                        let final_start_idx = start_idx.min(current_idx);
+                        let final_end_idx = start_idx.max(current_idx);
+                        let final_start_beat = start_beat.min(current_beat);
+                        let final_end_beat = start_beat.max(current_beat);
+
+                        if (final_end_beat - final_start_beat).abs() > 0.01 {
+                            let selection = SelectionRect {
+                                start_track_idx: final_start_idx,
+                                start_beat: final_start_beat,
+                                end_track_idx: final_end_idx,
+                                end_beat: final_end_beat,
+                            };
+                            (self.on_selection_change)(Some(selection));
+                        } else {
+                            (self.on_selection_change)(None);
+                        }
+                    } else {
+                        (self.on_selection_change)(None); // Dragged outside track area vertically
+                    }
+                }
+            }
+
+            if grid_response.drag_released_by(egui::PointerButton::Primary) {
+                // Reset the stored value using get_persisted_mut_or_default
+                ui.memory_mut(|mem| {
+                    *mem.data
+                        .get_persisted_mut_or_default::<Option<(usize, f32)>>(
+                            ui.id().with("selection_drag_start"),
+                        ) = None;
+                });
+                selection_drag_start = None; // Update local copy
+            }
+
+            if grid_response.clicked_by(egui::PointerButton::Primary) {
+                // Check the stored value directly
+                if selection_drag_start.is_none() {
+                    // Use the local copy
+                    (self.on_selection_change)(None);
+                } else {
+                    // Reset just in case drag release wasn't caught perfectly using get_persisted_mut_or_default
+                    ui.memory_mut(|mem| {
+                        *mem.data
+                            .get_persisted_mut_or_default::<Option<(usize, f32)>>(
+                                ui.id().with("selection_drag_start"),
+                            ) = None;
+                    });
+                    selection_drag_start = None; // Update local copy
+                }
+            }
+        }
+        // --- End Grid Background Interaction ---
+
+        // Draw selection rectangle if it exists
+        if let Some(selection) = &self.selection {
+            // Calculate pixel positions from beat positions
+            let start_beat_seconds = selection.start_beat / beats_per_second;
+            let end_beat_seconds = selection.end_beat / beats_per_second;
+
+            let start_x =
+                grid_rect.left() + (start_beat_seconds - h_scroll_offset) / seconds_per_pixel;
+            let end_x = grid_rect.left() + (end_beat_seconds - h_scroll_offset) / seconds_per_pixel;
+
+            // Calculate track positions
+            let start_y = grid_rect.top()
+                + selection.start_track_idx as f32 * (TRACK_HEIGHT + TRACK_SPACING)
+                - v_scroll_offset;
+            let end_y = grid_rect.top()
+                + (selection.end_track_idx as f32 + 1.0) * TRACK_HEIGHT
+                + selection.end_track_idx as f32 * TRACK_SPACING
+                - v_scroll_offset;
+
+            // Create selection rectangle
+            let selection_rect = egui::Rect::from_min_max(
+                egui::Pos2::new(start_x, start_y),
+                egui::Pos2::new(end_x, end_y),
+            );
+
+            // Draw semi-transparent fill
+            painter.rect_filled(
+                selection_rect,
+                0.0,
+                Color32::from_rgba_premultiplied(100, 150, 255, 64), // Light blue, semi-transparent
+            );
+
+            // Draw border
+            painter.rect_stroke(
+                selection_rect,
+                0.0,
+                Stroke::new(2.0, Color32::from_rgb(100, 150, 255)), // Light blue border
+            );
+        }
+
         // Draw playhead adjusted for horizontal scroll
         let visible_playhead_x =
-            grid_rect.left() + (self.timeline_position - self.h_scroll_offset) / seconds_per_pixel;
+            grid_rect.left() + (self.timeline_position - h_scroll_offset) / seconds_per_pixel;
 
         // Only draw playhead if it's in the visible area
         if visible_playhead_x >= grid_rect.left() && visible_playhead_x <= grid_rect.right() {
@@ -662,7 +853,7 @@ impl<'a> Grid<'a> {
             let h_visible_ratio = num_visible_seconds / total_duration;
             let h_thumb_width = h_visible_ratio * h_scrollbar_rect.width();
             let h_scroll_ratio =
-                self.h_scroll_offset / (total_duration - num_visible_seconds).max(0.001);
+                h_scroll_offset / (total_duration - num_visible_seconds).max(0.001);
             let h_thumb_left = h_scrollbar_rect.left()
                 + h_scroll_ratio * (h_scrollbar_rect.width() - h_thumb_width);
 
@@ -681,9 +872,8 @@ impl<'a> Grid<'a> {
                     .unwrap_or_default();
                 let click_pos_ratio =
                     (mouse_pos.x - h_scrollbar_rect.left()) / h_scrollbar_rect.width();
-                self.h_scroll_offset = click_pos_ratio * (total_duration - num_visible_seconds);
-                self.h_scroll_offset = self
-                    .h_scroll_offset
+                h_scroll_offset = click_pos_ratio * (total_duration - num_visible_seconds);
+                h_scroll_offset = h_scroll_offset
                     .max(0.0)
                     .min(total_duration - num_visible_seconds);
             }
@@ -709,8 +899,7 @@ impl<'a> Grid<'a> {
             // Calculate thumb size and position
             let v_visible_ratio = visible_height / total_grid_height;
             let v_thumb_height = v_visible_ratio * v_scrollbar_rect.height();
-            let v_scroll_ratio =
-                self.v_scroll_offset / (total_grid_height - visible_height).max(0.001);
+            let v_scroll_ratio = v_scroll_offset / (total_grid_height - visible_height).max(0.001);
             let v_thumb_top = v_scrollbar_rect.top()
                 + v_scroll_ratio * (v_scrollbar_rect.height() - v_thumb_height);
 
@@ -729,9 +918,8 @@ impl<'a> Grid<'a> {
                     .unwrap_or_default();
                 let click_pos_ratio =
                     (mouse_pos.y - v_scrollbar_rect.top()) / v_scrollbar_rect.height();
-                self.v_scroll_offset = click_pos_ratio * (total_grid_height - visible_height);
-                self.v_scroll_offset = self
-                    .v_scroll_offset
+                v_scroll_offset = click_pos_ratio * (total_grid_height - visible_height);
+                v_scroll_offset = v_scroll_offset
                     .max(0.0)
                     .min((total_grid_height - visible_height).max(0.0));
             }
@@ -742,9 +930,8 @@ impl<'a> Grid<'a> {
             let scroll_delta = ui.input(|i| i.scroll_delta);
             // Vertical scrolling with mouse wheel
             if scroll_delta.y != 0.0 {
-                self.v_scroll_offset += scroll_delta.y * -0.5; // Adjust sensitivity
-                self.v_scroll_offset = self
-                    .v_scroll_offset
+                v_scroll_offset += scroll_delta.y * -0.5; // Adjust sensitivity
+                v_scroll_offset = v_scroll_offset
                     .max(0.0)
                     .min((total_grid_height - visible_height).max(0.0));
             }
@@ -757,13 +944,16 @@ impl<'a> Grid<'a> {
                     scroll_delta.y
                 };
                 let time_delta = h_delta * -0.1 * seconds_per_pixel; // Adjust sensitivity
-                self.h_scroll_offset += time_delta;
-                self.h_scroll_offset = self
-                    .h_scroll_offset
+                h_scroll_offset += time_delta;
+                h_scroll_offset = h_scroll_offset
                     .max(0.0)
                     .min(total_duration - num_visible_seconds);
             }
         }
+
+        // Update the actual scroll offsets at the end of the function
+        self.h_scroll_offset = h_scroll_offset;
+        self.v_scroll_offset = v_scroll_offset;
     }
 }
 
@@ -1066,6 +1256,7 @@ impl eframe::App for DawApp {
                 h_scroll: f32,
                 v_scroll: f32,
             },
+            SetSelection(Option<SelectionRect>),
         }
 
         // Collect actions during UI rendering using Rc<RefCell>
@@ -1178,6 +1369,12 @@ impl eframe::App for DawApp {
                     },
                     h_scroll_offset: self.state.h_scroll_offset,
                     v_scroll_offset: self.state.v_scroll_offset,
+                    selection: self.state.selection.clone(),
+                    on_selection_change: &mut |new_selection: Option<SelectionRect>| {
+                        actions_clone
+                            .borrow_mut()
+                            .push(UiAction::SetSelection(new_selection));
+                    },
                 };
                 grid.draw(ui);
 
@@ -1340,6 +1537,9 @@ impl eframe::App for DawApp {
                 }
                 UiAction::UpdateScrollPosition { h_scroll, v_scroll } => {
                     self.dispatch(DawAction::UpdateScrollPosition(*h_scroll, *v_scroll));
+                }
+                UiAction::SetSelection(selection) => {
+                    self.dispatch(DawAction::SetSelection(selection.clone()));
                 }
             }
         }
