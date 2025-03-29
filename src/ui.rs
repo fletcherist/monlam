@@ -32,6 +32,7 @@ struct TransportControls<'a> {
     on_grid_change: &'a mut dyn FnMut(f32),
     on_save: &'a mut dyn FnMut(),
     on_load: &'a mut dyn FnMut(),
+    on_render: &'a mut dyn FnMut(),
 }
 
 impl<'a> TransportControls<'a> {
@@ -115,6 +116,16 @@ impl<'a> TransportControls<'a> {
                 .clicked()
             {
                 (self.on_load)();
+            }
+
+            // Render button
+            ui.add_space(16.0);
+            if ui
+                .button(RichText::new("🔊").size(20.0))
+                .on_hover_text("Render Selection to WAV")
+                .clicked()
+            {
+                (self.on_render)();
             }
         });
     }
@@ -1226,6 +1237,7 @@ impl eframe::App for DawApp {
             SetGridDivision(f32),
             SaveProject,
             LoadProject,
+            RenderSelection,
             SetTimelinePosition(f32),
             TrackDrag {
                 track_id: usize,
@@ -1310,6 +1322,9 @@ impl eframe::App for DawApp {
                 },
                 on_load: &mut || {
                     actions_clone.borrow_mut().push(UiAction::LoadProject);
+                },
+                on_render: &mut || {
+                    actions_clone.borrow_mut().push(UiAction::RenderSelection);
                 },
             }
             .draw(ui);
@@ -1469,6 +1484,16 @@ impl eframe::App for DawApp {
                 }
                 UiAction::LoadProject => {
                     self.load_project();
+                }
+                UiAction::RenderSelection => {
+                    // Open file dialog to select where to save the rendered WAV
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("WAV Audio", &["wav"])
+                        .set_title("Save Rendered Audio")
+                        .save_file()
+                    {
+                        self.dispatch(DawAction::RenderSelection(path));
+                    }
                 }
                 UiAction::SetTimelinePosition(pos) => {
                     // Snap to grid if close enough

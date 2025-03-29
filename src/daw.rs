@@ -42,6 +42,7 @@ pub enum DawAction {
     SetSampleTrimPoints(usize, usize, f32, f32), // track_id, sample_id, start, end
     UpdateScrollPosition(f32, f32), // h_scroll, v_scroll
     SetSelection(Option<SelectionRect>), // Use Option<SelectionRect>
+    RenderSelection(PathBuf),      // Path to save the rendered WAV file
 }
 
 const BUFFER_SIZE: usize = 1024;
@@ -1116,6 +1117,13 @@ impl DawApp {
                     // State already matched
                 }
             }
+            DawAction::RenderSelection(path) => {
+                if let Some(selection) = &self.state.selection {
+                    self.render_selection(&path, selection);
+                } else {
+                    eprintln!("Cannot render: No selection active");
+                }
+            }
         }
     }
 
@@ -1285,6 +1293,221 @@ impl DawApp {
     // Helper method to convert time in seconds to beats based on BPM
     pub fn time_to_beat(&self, time: f32) -> f32 {
         time * (self.state.bpm / 60.0)
+    }
+
+    pub fn render_selection(&self, output_path: &Path, selection: &SelectionRect) -> bool {
+        eprintln!("Starting render to {}", output_path.display());
+
+        // Calculate time range from the selection (in seconds)
+        let start_time = selection.start_beat * (60.0 / self.state.bpm);
+        let end_time = selection.end_beat * (60.0 / self.state.bpm);
+        let duration = end_time - start_time;
+
+        if duration <= 0.0 {
+            eprintln!("Cannot render: Invalid selection duration");
+            return false;
+        }
+
+        // Target sample rate and channels for rendering
+        let target_sample_rate = 44100;
+        let num_channels = 2; // Stereo output
+
+        // Size of each processing buffer (similar to real-time audio processing)
+        const BUFFER_SIZE: usize = 1024;
+
+        // Calculate total number of frames and buffers
+        let total_frames = (duration * target_sample_rate as f32) as usize;
+        let num_buffers = (total_frames + BUFFER_SIZE - 1) / BUFFER_SIZE;
+
+        // Create the WAV file with appropriate specs
+        use hound::{WavSpec, WavWriter};
+        let spec = WavSpec {
+            channels: num_channels as u16,
+            sample_rate: target_sample_rate,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+
+        let mut writer = match WavWriter::create(output_path, spec) {
+            Ok(writer) => writer,
+            Err(e) => {
+                eprintln!("Failed to create WAV file: {}", e);
+                return false;
+            }
+        };
+
+        // Get track range for the selection
+        let track_start = selection.start_track_idx;
+        let track_end = selection.end_track_idx;
+
+        // Check if we have valid track indices
+        if track_end >= self.state.tracks.len() || track_start > track_end {
+            eprintln!("Cannot render: Invalid track selection");
+            return false;
+        }
+
+        // Check if any track is soloed
+        let any_track_soloed = self.state.tracks.iter().any(|t| t.soloed);
+
+        // Process the audio in buffer-sized chunks to simulate real-time playback
+        for buffer_idx in 0..num_buffers {
+            // Create a buffer for this chunk
+            let mut mix_buffer = vec![0.0; BUFFER_SIZE * num_channels];
+
+            // Calculate current time position
+            let current_time =
+                start_time + (buffer_idx * BUFFER_SIZE) as f32 / target_sample_rate as f32;
+            let buffer_duration = BUFFER_SIZE as f32 / target_sample_rate as f32;
+
+            // Process each track
+            for track_idx in track_start..=track_end {
+                if track_idx >= self.state.tracks.len() {
+                    continue;
+                }
+
+                let track = &self.state.tracks[track_idx];
+
+                // Skip muted tracks or non-soloed tracks when soloing is active
+                if track.muted || (any_track_soloed && !track.soloed) {
+                    continue;
+                }
+
+                // Process each sample in the track
+                for sample in &track.samples {
+                    // Check if this sample is active during this time slice
+                    if current_time + buffer_duration <= sample.grid_start_time
+                        || current_time >= sample.grid_end_time
+                    {
+                        continue; // Sample not active in this time slice
+                    }
+
+                    // Calculate relative position within the sample
+                    let sample_offset = if current_time > sample.grid_start_time {
+                        current_time - sample.grid_start_time
+                    } else {
+                        0.0
+                    };
+
+                    // Apply trim offset
+                    let trimmed_offset = sample_offset + sample.trim_start;
+
+                    // Don't process if we're past the trim end
+                    if sample.trim_end > 0.0 && trimmed_offset >= sample.trim_end {
+                        continue;
+                    }
+
+                    // Get sample audio data
+                    let sample_buffer = if let Ok(buffer) = sample.audio_buffer.lock() {
+                        if buffer.is_empty() {
+                            continue;
+                        }
+                        buffer.clone()
+                    } else {
+                        continue; // Skip if we can't lock the buffer
+                    };
+
+                    // Get source sample rate for resampling
+                    let source_sample_rate = if let Some(waveform) = &sample.waveform {
+                        waveform.sample_rate
+                    } else {
+                        target_sample_rate
+                    };
+
+                    // Convert time offset to sample position
+                    let start_frame = (trimmed_offset * source_sample_rate as f32) as usize;
+
+                    // Calculate resampling ratio
+                    let rate_ratio = target_sample_rate as f32 / source_sample_rate as f32;
+
+                    // Process each frame in the current buffer
+                    for dest_frame in 0..BUFFER_SIZE {
+                        // Calculate the exact source position with resampling
+                        let source_frame_f32 =
+                            start_frame as f32 + (dest_frame as f32 / rate_ratio);
+                        let source_frame = source_frame_f32 as usize;
+
+                        // Skip if we're past the end of the sample or trim point
+                        let trim_end_frame = if sample.trim_end <= 0.0 {
+                            usize::MAX
+                        } else {
+                            (sample.trim_end * source_sample_rate as f32) as usize
+                        };
+
+                        if source_frame >= trim_end_frame
+                            || source_frame >= sample_buffer.len() / num_channels.max(1)
+                        {
+                            continue;
+                        }
+
+                        // Mix this sample frame into our buffer
+                        for channel in 0..num_channels {
+                            let dest_idx = dest_frame * num_channels + channel;
+
+                            if dest_idx < mix_buffer.len() {
+                                let sample_value =
+                                    if sample_buffer.len() >= num_channels * (source_frame + 1) {
+                                        // Stereo sample
+                                        sample_buffer[source_frame * num_channels + channel]
+                                    } else if !sample_buffer.is_empty() {
+                                        // Mono sample - duplicate to both channels
+                                        sample_buffer[source_frame.min(sample_buffer.len() - 1)]
+                                    } else {
+                                        0.0
+                                    };
+
+                                // Add sample to mix buffer
+                                mix_buffer[dest_idx] += sample_value;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Determine the actual buffer size (last buffer might be smaller)
+            let frames_left = total_frames - (buffer_idx * BUFFER_SIZE);
+            let actual_buffer_size = BUFFER_SIZE.min(frames_left);
+
+            // Normalize just this buffer to prevent clipping
+            self.normalize_audio_buffer(&mut mix_buffer[0..actual_buffer_size * num_channels]);
+
+            // Write buffer to WAV file
+            for i in 0..(actual_buffer_size * num_channels) {
+                // Convert f32 [-1.0, 1.0] to i16 range
+                let amplitude = (mix_buffer[i] * 32767.0) as i16;
+                if let Err(e) = writer.write_sample(amplitude) {
+                    eprintln!("Error writing sample: {}", e);
+                    return false;
+                }
+            }
+        }
+
+        // Finalize the WAV file
+        if let Err(e) = writer.finalize() {
+            eprintln!("Error finalizing WAV writer: {}", e);
+            return false;
+        }
+
+        eprintln!(
+            "Successfully rendered selection to {}",
+            output_path.display()
+        );
+        true
+    }
+
+    // Helper method to normalize audio to prevent clipping
+    fn normalize_audio_buffer(&self, buffer: &mut [f32]) {
+        // Find the maximum absolute amplitude
+        let max_amplitude = buffer
+            .iter()
+            .fold(0.0f32, |max, &sample| max.max(sample.abs()));
+
+        // Only normalize if we risk clipping
+        if max_amplitude > 1.0 {
+            let gain = 1.0 / max_amplitude;
+            for sample in buffer.iter_mut() {
+                *sample *= gain;
+            }
+        }
     }
 }
 
