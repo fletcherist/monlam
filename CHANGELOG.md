@@ -3,11 +3,13 @@
 [x] - feat: add 0.5 opacity subdivisions to grid for positions in snapping
 
 [x] - feat: zoom in and out of grid
-[] - chore: refactor ui code to separate handlers from ui
 [x] - click on the grid should move the playhead to that position
+[x] - fix: when sample dragging is finished and if it's selected, selection should move to the sample position. keep the selection rect visible
+
+[] - chore: refactor ui code to separate handlers from ui
 [] - when moving a sample, give it like 0.5 opacity
 [] - cmd + l should enable/disable loop mode
-[] - fix: when sample dragging is finished and if it's selected, selection should move to the sample position. keep the selection rect visible
+[x] - feat: delete selected sample by pressing backspace
 
 
 

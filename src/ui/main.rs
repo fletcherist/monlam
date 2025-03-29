@@ -574,6 +574,10 @@ impl eframe::App for DawApp {
             ToggleTrackMute(usize),
             ToggleTrackSolo(usize),
             ToggleTrackRecord(usize),
+            DeleteSample {
+                track_id: usize,
+                sample_id: usize,
+            },
             SetSampleTrim {
                 track_id: usize,
                 sample_id: usize,
@@ -729,6 +733,12 @@ impl eframe::App for DawApp {
                         actions_clone
                             .borrow_mut()
                             .push(UiAction::ToggleTrackRecord(track_id));
+                    },
+                    on_delete_sample: &mut |track_id, sample_id| {
+                        actions_clone.borrow_mut().push(UiAction::DeleteSample {
+                            track_id,
+                            sample_id,
+                        });
                     },
                     h_scroll_offset: self.state.h_scroll_offset,
                     v_scroll_offset: self.state.v_scroll_offset,
@@ -954,6 +964,12 @@ impl eframe::App for DawApp {
                 }
                 UiAction::SetZoomLevel(new_zoom) => {
                     self.dispatch(DawAction::SetZoomLevel(*new_zoom));
+                }
+                UiAction::DeleteSample {
+                    track_id,
+                    sample_id,
+                } => {
+                    self.dispatch(DawAction::DeleteSample(*track_id, *sample_id));
                 }
             }
         }

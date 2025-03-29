@@ -23,8 +23,9 @@ pub struct Grid<'a> {
     pub on_track_mute: &'a mut dyn FnMut(usize),                          // track_id
     pub on_track_solo: &'a mut dyn FnMut(usize),                          // track_id
     pub on_track_record: &'a mut dyn FnMut(usize),                        // track_id
-    pub h_scroll_offset: f32, // Horizontal scroll offset in seconds
-    pub v_scroll_offset: f32, // Vertical scroll offset in pixels
+    pub on_delete_sample: &'a mut dyn FnMut(usize, usize), // track_id, sample_id - Callback when a sample is deleted using backspace/delete key
+    pub h_scroll_offset: f32,                              // Horizontal scroll offset in seconds
+    pub v_scroll_offset: f32,                              // Vertical scroll offset in pixels
     pub selection: Option<SelectionRect>,
     pub on_selection_change: &'a mut dyn FnMut(Option<SelectionRect>),
     pub on_playhead_position_change: &'a mut dyn FnMut(f32), // Callback when playhead position changes
@@ -727,6 +728,52 @@ impl<'a> Grid<'a> {
                 ],
                 Stroke::new(2.0, PLAYHEAD_COLOR),
             );
+        }
+
+        // Handle keyboard events for deleting selected samples
+        if grid_response.has_focus()
+            || grid_response.clicked()
+            || grid_rect.contains(ui.input(|i| i.pointer.interact_pos().unwrap_or_default()))
+        {
+            if ui.input(|i| i.key_pressed(egui::Key::Backspace) || i.key_pressed(egui::Key::Delete))
+                && self.selection.is_some()
+            {
+                // Check if we have a single-track selection
+                if let Some(selection) = &self.selection {
+                    if selection.start_track_idx == selection.end_track_idx {
+                        let track_idx = selection.start_track_idx;
+
+                        // Get the track ID
+                        let track_id = self.tracks[track_idx].0;
+
+                        // Find samples that are within the selection
+                        let track = &self.tracks[track_idx];
+                        let samples = &track.5;
+
+                        // Look for samples that overlap with the selection bounds
+                        for (sample_id, _, position, length, _, _, _, _, _) in samples {
+                            let sample_end = *position + *length;
+
+                            // Check if the sample overlaps with the selection
+                            if (*position >= selection.start_beat && *position < selection.end_beat)
+                                || (sample_end > selection.start_beat
+                                    && sample_end <= selection.end_beat)
+                                || (*position <= selection.start_beat
+                                    && sample_end >= selection.end_beat)
+                            {
+                                // Delete the sample
+                                (self.on_delete_sample)(track_id, *sample_id);
+
+                                // Clear the selection after deleting
+                                (self.on_selection_change)(None);
+
+                                // Only delete one sample per backspace press
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         // Add horizontal scrollbar if needed
