@@ -44,9 +44,11 @@ pub enum DawAction {
     SetSampleTrimPoints(usize, usize, f32, f32),       // track_id, sample_id, start, end
     UpdateScrollPosition(f32, f32),                    // h_scroll, v_scroll
     SetSelection(Option<SelectionRect>),               // Use Option<SelectionRect>
-    ToggleLoopSelection,      // Toggle looping within the current selection
-    RenderSelection(PathBuf), // Path to save the rendered WAV file
-    SetZoomLevel(f32),        // Set the zoom level for the grid
+    ToggleLoopSelection,       // Toggle looping within the current selection
+    RenderSelection(PathBuf),  // Path to save the rendered WAV file
+    SetZoomLevel(f32),         // Set the zoom level for the grid
+    SetLoopRangeFromSelection, // Set loop range from current selection without toggling loop state
+    SetLoopRange(f32, f32),    // Set loop start and end times in seconds (None if no range set)
 }
 
 const BUFFER_SIZE: usize = 1024;
@@ -620,10 +622,16 @@ pub struct DawState {
     pub loop_enabled: bool, // Whether looping is enabled for the current selection
     #[serde(default = "default_zoom_level")]
     pub zoom_level: f32, // Zoom level for the grid view
+    #[serde(default = "default_loop_range")]
+    pub loop_range: Option<(f32, f32)>, // Loop start and end times in seconds (None if no range set)
 }
 
 fn default_zoom_level() -> f32 {
     1.0 // Default zoom level is 1.0 (100%)
+}
+
+fn default_loop_range() -> Option<(f32, f32)> {
+    None // Default is no loop range
 }
 
 impl Default for DawState {
@@ -652,6 +660,7 @@ impl Default for DawState {
             selection: None,
             loop_enabled: false,
             zoom_level: 1.0,
+            loop_range: None,
         }
     }
 }
@@ -814,6 +823,14 @@ impl DawApp {
             audio,
         };
 
+        // Create a default loop range from bar 1 to bar 4 if not set
+        if app.state.loop_range.is_none() {
+            let bars_per_beat = 4.0; // 4 beats per bar in 4/4 time
+            let default_start = 1.0 * bars_per_beat * (60.0 / app.state.bpm); // 1 bar in seconds (start at bar 1)
+            let default_end = 4.0 * bars_per_beat * (60.0 / app.state.bpm); // 4 bars in seconds (end at bar 4)
+            app.state.loop_range = Some((default_start, default_end));
+        }
+
         // Try to load last project if exists
         if let Some(path) = Self::load_config() {
             if path.exists() {
@@ -898,6 +915,9 @@ impl DawApp {
                 let current_position_in_beats =
                     self.state.timeline_position * (self.state.bpm / 60.0);
 
+                // Also convert horizontal scroll offset from time to beats
+                let scroll_offset_in_beats = self.state.h_scroll_offset * (self.state.bpm / 60.0);
+
                 // Update the BPM
                 self.state.bpm = bpm;
 
@@ -908,6 +928,9 @@ impl DawApp {
 
                 // Convert back to time at new BPM, maintaining the same beat position
                 self.state.timeline_position = current_position_in_beats * (60.0 / bpm);
+
+                // Also convert scroll offset back to time at new BPM
+                self.state.h_scroll_offset = scroll_offset_in_beats * (60.0 / bpm);
             }
             DawAction::SetGridDivision(division) => {
                 self.state.grid_division = division;
@@ -1260,6 +1283,8 @@ impl DawApp {
             }
             DawAction::ToggleLoopSelection => {
                 self.state.loop_enabled = !self.state.loop_enabled;
+                // No longer set the loop range based on selection
+                // We use SetLoopRangeFromSelection for that
             }
             DawAction::RenderSelection(path) => {
                 if let Some(selection) = &self.state.selection {
@@ -1270,6 +1295,20 @@ impl DawApp {
             }
             DawAction::SetZoomLevel(level) => {
                 self.state.zoom_level = level.clamp(0.1, 10.0);
+            }
+            DawAction::SetLoopRangeFromSelection => {
+                if let Some(selection) = &self.state.selection {
+                    let start_time = selection.start_beat * (60.0 / self.state.bpm);
+                    let end_time = selection.end_beat * (60.0 / self.state.bpm);
+                    self.state.loop_range = Some((start_time, end_time));
+                }
+            }
+            DawAction::SetLoopRange(start, end) => {
+                if start < end {
+                    self.state.loop_range = Some((start, end));
+                    // Enable looping if we're setting a loop range
+                    self.state.loop_enabled = true;
+                }
             }
         }
     }
@@ -1292,36 +1331,25 @@ impl DawApp {
     pub fn update_playback(&mut self) {
         if self.state.is_playing {
             let now = std::time::Instant::now();
-            let delta = now.duration_since(self.last_update).as_secs_f32();
-            self.last_update = now; // Update timestamp immediately to prevent accumulation errors
-
-            // Only use last_clicked_bar on the first frame of playback
-            if self.state.last_clicked_bar > 0.0 && self.seek_position.is_none() {
-                eprintln!("Starting playback from bar {}", self.state.last_clicked_bar);
-                self.seek_position = Some(self.state.last_clicked_bar);
-                self.state.last_clicked_bar = 0.0; // Reset to avoid restarting continuously
-                return; // Skip this frame, we'll handle the seek on the next update
-            }
+            let elapsed = now.duration_since(self.last_update).as_secs_f32();
+            self.last_update = now;
 
             // Update timeline position
-            self.state.timeline_position += delta;
+            self.state.timeline_position += elapsed;
 
-            // Handle looping within selection if enabled
-            if self.state.loop_enabled && self.state.selection.is_some() {
-                let selection = self.state.selection.as_ref().unwrap();
-                // Convert selection beats to time
-                let loop_start = selection.start_beat * (60.0 / self.state.bpm);
-                let loop_end = selection.end_beat * (60.0 / self.state.bpm);
+            // Handle looping based on loop range only (independent from selection)
+            if self.state.loop_enabled {
+                // Use loop range for looping
+                if let Some((start, end)) = self.state.loop_range {
+                    if self.state.timeline_position >= end {
+                        eprintln!("Looping back from loop range end to start");
+                        self.state.timeline_position = start;
 
-                // If we've passed the end of the selection, loop back to the start
-                if self.state.timeline_position >= loop_end {
-                    eprintln!("Looping back to selection start");
-                    self.state.timeline_position = loop_start;
-
-                    // Reset playback state for all samples
-                    for track in &mut self.state.tracks {
-                        for sample in &mut track.samples {
-                            sample.reset_playback();
+                        // Reset playback state for all samples
+                        for track in &mut self.state.tracks {
+                            for sample in &mut track.samples {
+                                sample.reset_playback();
+                            }
                         }
                     }
                 }
@@ -1430,6 +1458,7 @@ impl DawApp {
                 selection: None,
                 loop_enabled: false,
                 zoom_level: 1.0,
+                loop_range: None,
             },
             audio: Audio::new(),
             last_update: std::time::Instant::now(),

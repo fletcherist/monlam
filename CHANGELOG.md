@@ -7,6 +7,7 @@
 [x] - feat: delete selected sample by pressing backspace
 [x] - fix: handle unsupported audio format
 [x] - chore: move sample and it's business logic to separate file
+[x] - feat: basic loop range selection
 
 
 [] - chore: refactor ui code to separate handlers from ui
@@ -17,3 +18,9 @@
 
 
 [] - fix: zoom is implemented via alt, replace with cmd
+
+
+
+
+
+4. timeline is a place where i can add markers via right click -> add marker

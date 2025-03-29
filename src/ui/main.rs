@@ -8,7 +8,6 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 // UI Constants
-pub const TIMELINE_HEIGHT: f32 = 60.0;
 pub const TRACK_HEIGHT: f32 = 100.0;
 pub const TRACK_SPACING: f32 = 8.0;
 pub const GRID_BACKGROUND: Color32 = Color32::from_rgb(30, 30, 30);
@@ -150,94 +149,6 @@ impl<'a> TransportControls<'a> {
                 (self.on_render)();
             }
         });
-    }
-}
-
-struct Timeline<'a> {
-    is_playing: bool,
-    timeline_position: f32,
-    bpm: f32,
-    grid_division: f32,
-    on_timeline_click: &'a mut dyn FnMut(f32),
-    last_clicked_bar: f32,
-}
-
-impl<'a> Timeline<'a> {
-    fn draw(&mut self, ui: &mut egui::Ui) {
-        let available_width = ui.available_width();
-        let (rect, response) = ui.allocate_exact_size(
-            egui::Vec2::new(available_width, TIMELINE_HEIGHT),
-            egui::Sense::click_and_drag(),
-        );
-
-        // Calculate time scale (in seconds per pixel)
-        let pixels_per_beat = 50.0;
-        let beats_per_second = self.bpm / 60.0;
-        let seconds_per_pixel = 1.0 / (pixels_per_beat * beats_per_second);
-
-        if let Some(pos) = response.interact_pointer_pos() {
-            let timeline_position = (pos.x - rect.left()) * seconds_per_pixel;
-            (self.on_timeline_click)(timeline_position);
-        }
-
-        let painter = ui.painter_at(rect);
-
-        // Draw timeline background
-        painter.rect_filled(rect, 0.0, GRID_BACKGROUND);
-
-        // Draw grid lines
-        let num_visible_seconds = available_width * seconds_per_pixel;
-        let num_visible_beats = num_visible_seconds * beats_per_second;
-        let beat_width = pixels_per_beat;
-
-        for beat in 0..=(num_visible_beats.ceil() as i32) {
-            let x = rect.left() + beat as f32 * beat_width;
-            let color = if beat % 4 == 0 {
-                BAR_LINE_COLOR
-            } else {
-                BEAT_LINE_COLOR
-            };
-            painter.line_segment(
-                [
-                    egui::Pos2::new(x, rect.top()),
-                    egui::Pos2::new(x, rect.bottom()),
-                ],
-                Stroke::new(1.0, color),
-            );
-
-            // Draw beat number for every bar (4 beats)
-            if beat % 4 == 0 {
-                painter.text(
-                    egui::Pos2::new(x + 4.0, rect.top() + 12.0),
-                    egui::Align2::LEFT_TOP,
-                    format!("{}", beat / 4 + 1),
-                    egui::FontId::proportional(10.0),
-                    Color32::from_rgb(150, 150, 150),
-                );
-            }
-        }
-
-        // Draw playhead
-        let playhead_x = rect.left() + self.timeline_position / seconds_per_pixel;
-        painter.line_segment(
-            [
-                egui::Pos2::new(playhead_x, rect.top()),
-                egui::Pos2::new(playhead_x, rect.bottom()),
-            ],
-            Stroke::new(2.0, PLAYHEAD_COLOR),
-        );
-
-        // Draw last clicked bar marker if set
-        if self.last_clicked_bar > 0.0 {
-            let last_clicked_x = rect.left() + self.last_clicked_bar / seconds_per_pixel;
-            painter.line_segment(
-                [
-                    egui::Pos2::new(last_clicked_x, rect.top()),
-                    egui::Pos2::new(last_clicked_x, rect.bottom()),
-                ],
-                Stroke::new(2.0, Color32::from_rgb(0, 200, 0)),
-            );
-        }
     }
 }
 
@@ -407,6 +318,9 @@ impl eframe::App for DawApp {
         if ctx.input(|i| i.key_pressed(Key::L) && i.modifiers.command) {
             // Only enable looping if there's a selection
             if self.state.selection.is_some() {
+                // First set the loop range from the selection
+                self.dispatch(DawAction::SetLoopRangeFromSelection);
+                // Then toggle the loop state
                 self.dispatch(DawAction::ToggleLoopSelection);
 
                 // If we're enabling looping and playback is active, set the timeline position to the start of the selection
@@ -589,6 +503,7 @@ impl eframe::App for DawApp {
             },
             SetSelection(Option<SelectionRect>),
             ToggleLoopSelection,
+            SetLoopRangeFromSelection,
             SetZoomLevel(f32),
         }
 
@@ -642,27 +557,7 @@ impl eframe::App for DawApp {
         // Complete the UI with the central grid and track panels
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.vertical(|ui| {
-                // Timeline controls at the top
-                let actions_clone = actions.clone();
-                Timeline {
-                    is_playing,
-                    timeline_position,
-                    bpm,
-                    grid_division,
-                    last_clicked_bar,
-                    on_timeline_click: &mut |position| {
-                        actions_clone
-                            .borrow_mut()
-                            .push(UiAction::SetTimelinePosition(position));
-                    },
-                }
-                .draw(ui);
-
-                ui.add_space(8.0);
-                ui.separator();
-                ui.add_space(8.0);
-
-                // Add zoom level display and control
+                // Add zoom level display and control first
                 let actions_clone = actions.clone();
                 ui.horizontal(|ui| {
                     ui.label(format!("Zoom: {:.2}x", self.state.zoom_level));
@@ -675,6 +570,10 @@ impl eframe::App for DawApp {
                     ui.label("(Use Alt/Option + scroll or Alt + ↑/↓ keys to zoom)");
                 });
 
+                ui.add_space(4.0);
+
+                ui.add_space(8.0);
+                ui.separator();
                 ui.add_space(8.0);
 
                 // Grid in the middle
@@ -730,6 +629,11 @@ impl eframe::App for DawApp {
                             .push(UiAction::SetSelection(new_selection));
                     },
                     loop_enabled: self.state.loop_enabled,
+                    on_toggle_loop: &mut || {
+                        actions_clone
+                            .borrow_mut()
+                            .push(UiAction::ToggleLoopSelection);
+                    },
                     zoom_level: self.state.zoom_level,
                     on_zoom_change: &mut |new_zoom| {
                         actions_clone
@@ -933,6 +837,9 @@ impl eframe::App for DawApp {
                 UiAction::ToggleLoopSelection => {
                     // Only toggle loop if there's a selection
                     if self.state.selection.is_some() {
+                        // First set the loop range from the selection
+                        self.dispatch(DawAction::SetLoopRangeFromSelection);
+                        // Then toggle the loop state
                         self.dispatch(DawAction::ToggleLoopSelection);
 
                         // If we're enabling looping and playback is active, set the timeline position to the start of the selection
@@ -942,6 +849,9 @@ impl eframe::App for DawApp {
                             self.dispatch(DawAction::SetTimelinePosition(loop_start));
                         }
                     }
+                }
+                UiAction::SetLoopRangeFromSelection => {
+                    self.dispatch(DawAction::SetLoopRangeFromSelection);
                 }
                 UiAction::SetZoomLevel(new_zoom) => {
                     self.dispatch(DawAction::SetZoomLevel(*new_zoom));
