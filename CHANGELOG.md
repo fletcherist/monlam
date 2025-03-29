@@ -4,10 +4,10 @@
 
 [x] - feat: zoom in and out of grid
 [] - chore: refactor ui code to separate handlers from ui
-[] - click on the grid should move the playhead to that position
+[x] - click on the grid should move the playhead to that position
 [] - when moving a sample, give it like 0.5 opacity
 [] - cmd + l should enable/disable loop mode
-
+[] - fix: when sample dragging is finished and if it's selected, selection should move to the sample position. keep the selection rect visible
 
 
 

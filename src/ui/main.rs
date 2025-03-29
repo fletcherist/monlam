@@ -745,6 +745,11 @@ impl eframe::App for DawApp {
                             .borrow_mut()
                             .push(UiAction::SetZoomLevel(new_zoom));
                     },
+                    on_playhead_position_change: &mut |new_position| {
+                        actions_clone
+                            .borrow_mut()
+                            .push(UiAction::SetTimelinePosition(new_position));
+                    },
                 };
                 grid.draw(ui);
 
