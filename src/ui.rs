@@ -19,6 +19,7 @@ const TRACK_TEXT_COLOR: Color32 = Color32::from_rgb(200, 200, 200);
 const WAVEFORM_COLOR: Color32 = Color32::from_rgb(100, 100, 100);
 const SAMPLE_BORDER_COLOR: Color32 = Color32::from_rgb(60, 60, 60);
 const SCROLLBAR_SIZE: f32 = 14.0;
+const BASE_PIXELS_PER_BEAT: f32 = 50.0; // Base pixels per beat at zoom level 1.0
 
 // UI Components
 struct TransportControls<'a> {
@@ -261,6 +262,8 @@ struct Grid<'a> {
     selection: Option<SelectionRect>,
     on_selection_change: &'a mut dyn FnMut(Option<SelectionRect>),
     loop_enabled: bool,
+    zoom_level: f32, // Zoom level for the grid view (1.0 = 100%)
+    on_zoom_change: &'a mut dyn FnMut(f32), // Callback when zoom changes
 }
 
 // Add this after the main struct definitions, before struct implementations
@@ -365,6 +368,34 @@ trait SampleDragging {
     fn end_sample_drag(ui: &mut egui::Ui);
 }
 
+/// Trait for handling grid zooming operations
+trait GridZooming {
+    fn handle_grid_zooming(
+        ui: &mut egui::Ui,
+        grid_rect: &egui::Rect,
+        grid_response: &egui::Response,
+        zoom_level: &mut f32,
+        h_scroll_offset: &mut f32,
+        beats_per_second: f32,
+        seconds_per_pixel: f32,
+        actual_width: f32,
+        total_duration: f32,
+        on_zoom_change: &mut dyn FnMut(f32),
+    );
+
+    fn process_mouse_wheel_zoom(
+        ui: &mut egui::Ui,
+        grid_rect: &egui::Rect,
+        zoom_level: &mut f32,
+        h_scroll_offset: &mut f32,
+        beats_per_second: f32,
+        seconds_per_pixel: f32,
+        actual_width: f32,
+        total_duration: f32,
+        on_zoom_change: &mut dyn FnMut(f32),
+    );
+}
+
 impl<'a> Grid<'a> {
     fn draw(&mut self, ui: &mut egui::Ui) {
         // Declare selection_drag_start using ui.memory_mut, storing Option<(usize, f32)> directly
@@ -414,7 +445,7 @@ impl<'a> Grid<'a> {
         };
 
         // Calculate time scale (in seconds per pixel)
-        let pixels_per_beat = 50.0;
+        let pixels_per_beat = BASE_PIXELS_PER_BEAT * self.zoom_level;
         let beats_per_second = self.bpm / 60.0;
         let seconds_per_pixel = 1.0 / (pixels_per_beat * beats_per_second);
 
@@ -977,6 +1008,20 @@ impl<'a> Grid<'a> {
                     .max(0.0)
                     .min(total_duration - num_visible_seconds);
             }
+
+            // Handle grid zooming
+            <Self as GridZooming>::handle_grid_zooming(
+                ui,
+                &grid_rect,
+                &grid_response,
+                &mut self.zoom_level,
+                &mut h_scroll_offset,
+                beats_per_second,
+                seconds_per_pixel,
+                actual_width,
+                total_duration,
+                &mut self.on_zoom_change,
+            );
         }
 
         // Update the actual scroll offsets at the end of the function
@@ -1456,6 +1501,107 @@ impl<'a> SampleDragging for Grid<'a> {
     }
 }
 
+// Implement the GridZooming trait for Grid
+impl<'a> GridZooming for Grid<'a> {
+    fn handle_grid_zooming(
+        ui: &mut egui::Ui,
+        grid_rect: &egui::Rect,
+        grid_response: &egui::Response,
+        zoom_level: &mut f32,
+        h_scroll_offset: &mut f32,
+        beats_per_second: f32,
+        seconds_per_pixel: f32,
+        actual_width: f32,
+        total_duration: f32,
+        on_zoom_change: &mut dyn FnMut(f32),
+    ) {
+        // Check if Alt/Option key is pressed
+        let alt_pressed = ui.input(|i| i.modifiers.alt);
+
+        if alt_pressed && grid_response.hovered() {
+            Self::process_mouse_wheel_zoom(
+                ui,
+                grid_rect,
+                zoom_level,
+                h_scroll_offset,
+                beats_per_second,
+                seconds_per_pixel,
+                actual_width,
+                total_duration,
+                on_zoom_change,
+            );
+        }
+    }
+
+    fn process_mouse_wheel_zoom(
+        ui: &mut egui::Ui,
+        grid_rect: &egui::Rect,
+        zoom_level: &mut f32,
+        h_scroll_offset: &mut f32,
+        beats_per_second: f32,
+        seconds_per_pixel: f32,
+        actual_width: f32,
+        total_duration: f32,
+        on_zoom_change: &mut dyn FnMut(f32),
+    ) {
+        // Get the scroll input
+        let scroll_input = ui.input(|i| i.scroll_delta);
+
+        if scroll_input.y != 0.0 {
+            // Calculate zoom factor based on scroll direction - reduced sensitivity
+            let zoom_delta = if scroll_input.y > 0.0 { 1.05 } else { 0.95 };
+            let old_zoom = *zoom_level;
+            let new_zoom = (old_zoom * zoom_delta).clamp(0.1, 10.0);
+
+            // Get mouse position for zooming to cursor position
+            if let Some(mouse_pos) = ui.input(|i| i.pointer.hover_pos()) {
+                if grid_rect.contains(mouse_pos) {
+                    // Calculate time at mouse position before zoom
+                    let mouse_x_relative = mouse_pos.x - grid_rect.left();
+                    let time_at_mouse_before =
+                        *h_scroll_offset + mouse_x_relative * seconds_per_pixel;
+
+                    // Update zoom level
+                    *zoom_level = new_zoom;
+
+                    // Calculate new seconds_per_pixel after zoom change
+                    let new_pixels_per_beat = BASE_PIXELS_PER_BEAT * new_zoom;
+                    let new_seconds_per_pixel = 1.0 / (new_pixels_per_beat * beats_per_second);
+
+                    // Calculate new scroll position to keep mouse over same time position
+                    *h_scroll_offset =
+                        time_at_mouse_before - mouse_x_relative * new_seconds_per_pixel;
+
+                    // Constrain horizontal scroll
+                    *h_scroll_offset = h_scroll_offset
+                        .max(0.0)
+                        .min(total_duration - (actual_width * new_seconds_per_pixel));
+
+                    eprintln!(
+                        "Alt+Scroll zooming from {:.2} to {:.2} at time position {:.2}",
+                        old_zoom, new_zoom, time_at_mouse_before
+                    );
+
+                    // Report zoom change through callback
+                    (on_zoom_change)(new_zoom);
+                } else {
+                    // Mouse is outside grid, just update zoom level
+                    *zoom_level = new_zoom;
+                    (on_zoom_change)(new_zoom);
+                }
+            } else {
+                // No mouse position, just zoom centered
+                *zoom_level = new_zoom;
+                (on_zoom_change)(new_zoom);
+                eprintln!(
+                    "Alt+Scroll zoom (centered): {:.2} to {:.2}",
+                    old_zoom, new_zoom
+                );
+            }
+        }
+    }
+}
+
 struct TrackControls<'a> {
     tracks: Vec<(
         usize,
@@ -1633,6 +1779,28 @@ impl eframe::App for DawApp {
             }
         }
 
+        // Handle Alt+Up/Down arrow keys for zoom
+        if ctx.input(|i| i.modifiers.alt) {
+            if ctx.input(|i| i.key_pressed(Key::ArrowUp)) {
+                // Reduced sensitivity (1.05 instead of 1.1)
+                let zoom_delta = 1.05;
+                let old_zoom = self.state.zoom_level;
+                let new_zoom = (self.state.zoom_level * zoom_delta).clamp(0.1, 10.0);
+
+                eprintln!("Alt+Up arrow zoom: {:.2} to {:.2}", old_zoom, new_zoom);
+                self.dispatch(DawAction::SetZoomLevel(new_zoom));
+            }
+            if ctx.input(|i| i.key_pressed(Key::ArrowDown)) {
+                // Reduced sensitivity (0.95 instead of 0.9)
+                let zoom_delta = 0.95;
+                let old_zoom = self.state.zoom_level;
+                let new_zoom = (self.state.zoom_level * zoom_delta).clamp(0.1, 10.0);
+
+                eprintln!("Alt+Down arrow zoom: {:.2} to {:.2}", old_zoom, new_zoom);
+                self.dispatch(DawAction::SetZoomLevel(new_zoom));
+            }
+        }
+
         // Update timeline position based on audio playback
         self.update_playback();
 
@@ -1779,6 +1947,7 @@ impl eframe::App for DawApp {
             },
             SetSelection(Option<SelectionRect>),
             ToggleLoopSelection,
+            SetZoomLevel(f32),
         }
 
         // Collect actions during UI rendering using Rc<RefCell>
@@ -1869,6 +2038,21 @@ impl eframe::App for DawApp {
                 ui.separator();
                 ui.add_space(8.0);
 
+                // Add zoom level display and control
+                let actions_clone = actions.clone();
+                ui.horizontal(|ui| {
+                    ui.label(format!("Zoom: {:.2}x", self.state.zoom_level));
+
+                    // Add a button to reset zoom
+                    if ui.button("Reset Zoom").clicked() {
+                        actions_clone.borrow_mut().push(UiAction::SetZoomLevel(1.0));
+                    }
+
+                    ui.label("(Use Alt/Option + scroll or Alt + ↑/↓ keys to zoom)");
+                });
+
+                ui.add_space(8.0);
+
                 // Grid in the middle
                 let actions_clone = actions.clone();
                 let mut grid = Grid {
@@ -1916,6 +2100,12 @@ impl eframe::App for DawApp {
                             .push(UiAction::SetSelection(new_selection));
                     },
                     loop_enabled: self.state.loop_enabled,
+                    zoom_level: self.state.zoom_level,
+                    on_zoom_change: &mut |new_zoom| {
+                        actions_clone
+                            .borrow_mut()
+                            .push(UiAction::SetZoomLevel(new_zoom));
+                    },
                 };
                 grid.draw(ui);
 
@@ -2117,6 +2307,9 @@ impl eframe::App for DawApp {
                             self.dispatch(DawAction::SetTimelinePosition(loop_start));
                         }
                     }
+                }
+                UiAction::SetZoomLevel(new_zoom) => {
+                    self.dispatch(DawAction::SetZoomLevel(*new_zoom));
                 }
             }
         }

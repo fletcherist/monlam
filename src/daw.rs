@@ -45,6 +45,7 @@ pub enum DawAction {
     SetSelection(Option<SelectionRect>),               // Use Option<SelectionRect>
     ToggleLoopSelection,      // Toggle looping within the current selection
     RenderSelection(PathBuf), // Path to save the rendered WAV file
+    SetZoomLevel(f32),        // Set the zoom level for the grid
 }
 
 const BUFFER_SIZE: usize = 1024;
@@ -601,6 +602,12 @@ pub struct DawState {
     pub selection: Option<SelectionRect>, // Use Option<SelectionRect>
     #[serde(default)]
     pub loop_enabled: bool, // Whether looping is enabled for the current selection
+    #[serde(default = "default_zoom_level")]
+    pub zoom_level: f32, // Zoom level for the grid view
+}
+
+fn default_zoom_level() -> f32 {
+    1.0 // Default zoom level is 1.0 (100%)
 }
 
 impl Default for DawState {
@@ -628,6 +635,7 @@ impl Default for DawState {
             v_scroll_offset: 0.0,
             selection: None,
             loop_enabled: false,
+            zoom_level: 1.0,
         }
     }
 }
@@ -1210,6 +1218,9 @@ impl DawApp {
                     eprintln!("Cannot render: No selection active");
                 }
             }
+            DawAction::SetZoomLevel(level) => {
+                self.state.zoom_level = level.clamp(0.1, 10.0);
+            }
         }
     }
 
@@ -1368,6 +1379,7 @@ impl DawApp {
                 v_scroll_offset: 0.0,
                 selection: None,
                 loop_enabled: false,
+                zoom_level: 1.0,
             },
             audio: Audio::new(),
             last_update: std::time::Instant::now(),
