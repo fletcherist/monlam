@@ -449,7 +449,6 @@ impl eframe::App for DawApp {
         let bpm = self.state.bpm;
         let grid_division = self.state.grid_division;
         let last_clicked_bar = self.state.last_clicked_bar;
-        let drag_offset = self.state.drag_offset;
 
         // Create track info to avoid borrowing self in closures
         let track_info: Vec<_> = self
@@ -595,24 +594,6 @@ impl eframe::App for DawApp {
 
         // Collect actions during UI rendering using Rc<RefCell>
         let actions = Rc::new(RefCell::new(Vec::new()));
-
-        // Helper function to snap to grid without borrowing self
-        let grid_division_value = grid_division;
-        let snap_to_grid = move |position: f32| -> f32 {
-            // Calculate the nearest grid line
-            let grid_lines = position / grid_division_value;
-            let lower_grid_line = grid_lines.floor();
-            let upper_grid_line = grid_lines.ceil();
-
-            // Determine whether to snap to the lower or upper grid line
-            if position - (lower_grid_line * grid_division_value)
-                < (upper_grid_line * grid_division_value) - position
-            {
-                lower_grid_line * grid_division_value
-            } else {
-                upper_grid_line * grid_division_value
-            }
-        };
 
         // Add the top toolbar with transport controls
         egui::TopBottomPanel::top("transport_controls").show(ctx, |ui| {
