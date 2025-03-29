@@ -252,11 +252,12 @@ struct Grid<'a> {
         Vec<(usize, String, f32, f32, Vec<f32>, u32, f32, f32, f32)>,
     )>, // Track ID, Name, muted, soloed, recording, samples: (Sample ID, name, position, length, waveform, sample_rate, duration, audio_start_time, audio_end_time)
     on_track_drag: &'a mut dyn FnMut(usize, usize, f32), // track_id, sample_id, new_position
-    on_track_mute: &'a mut dyn FnMut(usize),             // track_id
-    on_track_solo: &'a mut dyn FnMut(usize),             // track_id
-    on_track_record: &'a mut dyn FnMut(usize),           // track_id
-    h_scroll_offset: f32,                                // Horizontal scroll offset in seconds
-    v_scroll_offset: f32,                                // Vertical scroll offset in pixels
+    on_cross_track_move: &'a mut dyn FnMut(usize, usize, usize, f32), // source_track_id, sample_id, target_track_id, new_position
+    on_track_mute: &'a mut dyn FnMut(usize),                          // track_id
+    on_track_solo: &'a mut dyn FnMut(usize),                          // track_id
+    on_track_record: &'a mut dyn FnMut(usize),                        // track_id
+    h_scroll_offset: f32, // Horizontal scroll offset in seconds
+    v_scroll_offset: f32, // Vertical scroll offset in pixels
     selection: Option<SelectionRect>,
     on_selection_change: &'a mut dyn FnMut(Option<SelectionRect>),
     loop_enabled: bool,
@@ -272,6 +273,18 @@ impl<'a> Grid<'a> {
                 })
                 .clone() // Clone the Option<(usize, f32)>
         });
+
+        // Store the currently dragged sample, if any
+        let dragged_sample = ui.memory_mut(|mem| {
+            mem.data
+                .get_persisted_mut_or_insert_with(ui.id().with("dragged_sample"), || {
+                    None::<(usize, usize, f32)> // (track_id, sample_id, initial_click_offset_in_beats)
+                })
+                .clone()
+        });
+
+        // Track if the current frame processed a sample drag
+        let mut sample_dragged_this_frame = false;
 
         // Create local copies of scroll offsets to avoid borrowing issues
         let mut h_scroll_offset = self.h_scroll_offset;
@@ -716,14 +729,97 @@ impl<'a> Grid<'a> {
                         clicked_on_sample_in_track = true;
                     }
 
-                    if region_response.dragged() {
+                    // Check for drag start
+                    if region_response.drag_started() {
+                        // Calculate click offset from the start of the sample in beats
+                        let click_offset_beats =
+                            if let Some(pointer_pos) = region_response.interact_pointer_pos() {
+                                let click_beat = screen_x_to_beat(pointer_pos.x);
+                                click_beat - *position // offset from start of sample
+                            } else {
+                                0.0 // Fallback if we can't get the pointer position
+                            };
+
+                        // Store the dragged sample with the offset
+                        ui.memory_mut(|mem| {
+                            *mem.data
+                                .get_persisted_mut_or_default::<Option<(usize, usize, f32)>>(
+                                    ui.id().with("dragged_sample"),
+                                ) = Some((*track_id, *sample_id, click_offset_beats));
+                        });
+                    }
+
+                    // Check for drag during this frame
+                    if region_response.dragged() && !sample_dragged_this_frame {
                         let delta = region_response.drag_delta().x;
                         let time_delta = delta * seconds_per_pixel;
                         let beat_delta = time_delta * beats_per_second;
                         let new_position = *position + beat_delta;
+
+                        // We'll only use this for within-track drags, as between-track drags are handled above
                         (self.on_track_drag)(*track_id, *sample_id, new_position);
+                        sample_dragged_this_frame = true;
                     }
                 }
+            }
+        }
+
+        // Check if we have a dragged sample from previous frames, and the mouse button is still down
+        if let Some((drag_track_id, drag_sample_id, click_offset_beats)) = dragged_sample {
+            if ui.input(|i| i.pointer.primary_down()) {
+                // Get current mouse position
+                if let Some(pointer_pos) = ui.input(|i| i.pointer.interact_pos()) {
+                    // Calculate new sample position based on mouse position, maintaining the initial click offset
+                    if let Some(target_track_idx) = screen_y_to_track_index(pointer_pos.y) {
+                        let pointer_beat_position = screen_x_to_beat(pointer_pos.x);
+                        let new_beat_position = pointer_beat_position - click_offset_beats;
+
+                        // Get target track id
+                        let target_track_id = self.tracks[target_track_idx].0;
+
+                        // Find the source track index
+                        let source_track_idx = self
+                            .tracks
+                            .iter()
+                            .position(|(id, _, _, _, _, _)| *id == drag_track_id);
+
+                        if let Some(source_idx) = source_track_idx {
+                            // If target track is different from source track, move between tracks
+                            if target_track_id != drag_track_id {
+                                (self.on_cross_track_move)(
+                                    drag_track_id,
+                                    drag_sample_id,
+                                    target_track_id,
+                                    new_beat_position,
+                                );
+
+                                // Update the dragged sample to the new track, maintaining the offset
+                                ui.memory_mut(|mem| {
+                                    *mem.data.get_persisted_mut_or_default::<Option<(usize, usize, f32)>>(
+                                        ui.id().with("dragged_sample"),
+                                    ) = Some((target_track_id, drag_sample_id, click_offset_beats));
+                                });
+                            } else {
+                                // Move within the same track
+                                (self.on_track_drag)(
+                                    drag_track_id,
+                                    drag_sample_id,
+                                    new_beat_position,
+                                );
+                            }
+
+                            sample_dragged_this_frame = true;
+                        }
+                    }
+                }
+            } else {
+                // Mouse button released, clear the dragged sample
+                ui.memory_mut(|mem| {
+                    *mem.data
+                        .get_persisted_mut_or_default::<Option<(usize, usize, f32)>>(
+                            ui.id().with("dragged_sample"),
+                        ) = None;
+                });
             }
         }
 
@@ -1287,6 +1383,12 @@ impl eframe::App for DawApp {
                 sample_id: usize,
                 position: f32,
             },
+            CrossTrackMove {
+                source_track_id: usize,
+                sample_id: usize,
+                target_track_id: usize,
+                position: f32,
+            },
             SetSamplePosition {
                 track_id: usize,
                 sample_id: usize,
@@ -1417,6 +1519,15 @@ impl eframe::App for DawApp {
                             position,
                         });
                     },
+                    on_cross_track_move:
+                        &mut |source_track_id, sample_id, target_track_id, position| {
+                            actions_clone.borrow_mut().push(UiAction::CrossTrackMove {
+                                source_track_id,
+                                sample_id,
+                                target_track_id,
+                                position,
+                            });
+                        },
                     on_track_mute: &mut |track_id| {
                         actions_clone
                             .borrow_mut()
@@ -1566,6 +1677,19 @@ impl eframe::App for DawApp {
                     position,
                 } => {
                     self.dispatch(DawAction::MoveSample(*track_id, *sample_id, *position));
+                }
+                UiAction::CrossTrackMove {
+                    source_track_id,
+                    sample_id,
+                    target_track_id,
+                    position,
+                } => {
+                    self.dispatch(DawAction::MoveSampleBetweenTracks(
+                        *source_track_id,
+                        *sample_id,
+                        *target_track_id,
+                        *position,
+                    ));
                 }
                 UiAction::SetSamplePosition {
                     track_id,

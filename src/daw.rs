@@ -37,13 +37,14 @@ pub enum DawAction {
     ToggleTrackRecord(usize),
     AddSampleToTrack(usize, PathBuf),
     MoveSample(usize, usize, f32), // track_id, sample_id, new_position
-    SetSampleLength(usize, usize, f32), // track_id, sample_id, new_length
-    DeleteSample(usize, usize),    // track_id, sample_id
-    SetSampleTrimPoints(usize, usize, f32, f32), // track_id, sample_id, start, end
-    UpdateScrollPosition(f32, f32), // h_scroll, v_scroll
-    SetSelection(Option<SelectionRect>), // Use Option<SelectionRect>
-    ToggleLoopSelection,           // Toggle looping within the current selection
-    RenderSelection(PathBuf),      // Path to save the rendered WAV file
+    MoveSampleBetweenTracks(usize, usize, usize, f32), // source_track_id, sample_id, target_track_id, new_position
+    SetSampleLength(usize, usize, f32),                // track_id, sample_id, new_length
+    DeleteSample(usize, usize),                        // track_id, sample_id
+    SetSampleTrimPoints(usize, usize, f32, f32),       // track_id, sample_id, start, end
+    UpdateScrollPosition(f32, f32),                    // h_scroll, v_scroll
+    SetSelection(Option<SelectionRect>),               // Use Option<SelectionRect>
+    ToggleLoopSelection,      // Toggle looping within the current selection
+    RenderSelection(PathBuf), // Path to save the rendered WAV file
 }
 
 const BUFFER_SIZE: usize = 1024;
@@ -1026,17 +1027,95 @@ impl DawApp {
                             .collect();
 
                         // Adjust the length of overlapping samples
-                        for overlap_id in overlapping_samples {
-                            if let Some(other_sample) = track.get_sample_mut(overlap_id) {
-                                // If this is a sample that starts before our current sample
+                        for other_id in overlapping_samples {
+                            if let Some(other_sample) = track.get_sample_mut(other_id) {
+                                // If the other sample starts before the current one
                                 if other_sample.grid_position < current_sample_start {
-                                    // Adjust its length to end exactly at the start of our current sample
                                     let new_length =
                                         current_sample_start - other_sample.grid_position;
-                                    eprintln!("Adjusting sample {} length from {} to {} due to overlap with sample {}", 
-                                              other_sample.id, other_sample.grid_length, new_length, sample_id);
-                                    other_sample.grid_length = new_length;
-                                    other_sample.update_grid_times(self.state.bpm);
+                                    if new_length > 0.0 {
+                                        other_sample.grid_length = new_length;
+                                        other_sample.update_grid_times(self.state.bpm);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            DawAction::MoveSampleBetweenTracks(
+                source_track_id,
+                sample_id,
+                target_track_id,
+                new_position,
+            ) => {
+                // Find source track and get the sample
+                let sample_to_move = if let Some(source_track) = self
+                    .state
+                    .tracks
+                    .iter_mut()
+                    .find(|t| t.id == source_track_id)
+                {
+                    // Get the sample index
+                    let sample_index = source_track.samples.iter().position(|s| s.id == sample_id);
+
+                    // If sample found, remove it from source track
+                    if let Some(idx) = sample_index {
+                        Some(source_track.samples.remove(idx))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                // Now if we have the sample, add it to the target track
+                if let Some(mut sample) = sample_to_move {
+                    if let Some(target_track) = self
+                        .state
+                        .tracks
+                        .iter_mut()
+                        .find(|t| t.id == target_track_id)
+                    {
+                        // Update the sample's position to the new position
+                        sample.grid_position = new_position;
+                        sample.update_grid_times(self.state.bpm);
+
+                        // Add sample to target track
+                        target_track.samples.push(sample);
+
+                        // Now handle any overlapping samples in the target track
+                        let current_sample_id = target_track.samples.last().unwrap().id;
+                        let current_sample_start = new_position;
+                        let current_sample_end =
+                            new_position + target_track.samples.last().unwrap().grid_length;
+
+                        // Collect samples that overlap with the moved sample
+                        let overlapping_samples: Vec<usize> = target_track
+                            .samples
+                            .iter()
+                            .filter(|s| s.id != current_sample_id) // Skip the moved sample
+                            .filter(|s| {
+                                let other_start = s.grid_position;
+                                let other_end = s.grid_position + s.grid_length;
+
+                                // Check if the samples overlap
+                                current_sample_start < other_end && current_sample_end > other_start
+                            })
+                            .map(|s| s.id)
+                            .collect();
+
+                        // Adjust the length of overlapping samples
+                        for other_id in overlapping_samples {
+                            if let Some(other_sample) = target_track.get_sample_mut(other_id) {
+                                // If the other sample starts before the moved one
+                                if other_sample.grid_position < current_sample_start {
+                                    let new_length =
+                                        current_sample_start - other_sample.grid_position;
+                                    if new_length > 0.0 {
+                                        other_sample.grid_length = new_length;
+                                        other_sample.update_grid_times(self.state.bpm);
+                                    }
                                 }
                             }
                         }
