@@ -263,6 +263,108 @@ struct Grid<'a> {
     loop_enabled: bool,
 }
 
+// Add this after the main struct definitions, before struct implementations
+
+/// Trait for handling grid selection operations
+trait GridSelection {
+    fn handle_grid_selection(
+        ui: &mut egui::Ui,
+        grid_response: &egui::Response,
+        screen_x_to_beat: &dyn Fn(f32) -> f32,
+        screen_y_to_track_index: &dyn Fn(f32) -> Option<usize>,
+        snap_to_grid: &dyn Fn(f32) -> f32,
+        selection_drag_start: &mut Option<(usize, f32)>,
+        on_selection_change: &mut dyn FnMut(Option<SelectionRect>),
+    );
+
+    fn start_selection_drag(
+        ui: &mut egui::Ui,
+        grid_response: &egui::Response,
+        screen_x_to_beat: &dyn Fn(f32) -> f32,
+        screen_y_to_track_index: &dyn Fn(f32) -> Option<usize>,
+        snap_to_grid: &dyn Fn(f32) -> f32,
+        selection_drag_start: &mut Option<(usize, f32)>,
+        on_selection_change: &mut dyn FnMut(Option<SelectionRect>),
+    );
+
+    fn update_selection_during_drag(
+        grid_response: &egui::Response,
+        selection_start: Option<(usize, f32)>,
+        screen_x_to_beat: &dyn Fn(f32) -> f32,
+        screen_y_to_track_index: &dyn Fn(f32) -> Option<usize>,
+        snap_to_grid: &dyn Fn(f32) -> f32,
+        on_selection_change: &mut dyn FnMut(Option<SelectionRect>),
+    );
+
+    fn end_selection_drag(ui: &mut egui::Ui, selection_drag_start: &mut Option<(usize, f32)>);
+
+    fn handle_selection_click(
+        ui: &mut egui::Ui,
+        selection_drag_start: &mut Option<(usize, f32)>,
+        on_selection_change: &mut dyn FnMut(Option<SelectionRect>),
+    );
+}
+
+/// Trait for handling sample dragging operations
+trait SampleDragging {
+    fn handle_sample_dragging(
+        ui: &mut egui::Ui,
+        grid_rect: &egui::Rect,
+        tracks: &Vec<(
+            usize,
+            String,
+            bool,
+            bool,
+            bool,
+            Vec<(usize, String, f32, f32, Vec<f32>, u32, f32, f32, f32)>,
+        )>,
+        drag_track_id: usize,
+        drag_sample_id: usize,
+        click_offset_beats: f32,
+        screen_x_to_beat: &dyn Fn(f32) -> f32,
+        screen_y_to_track_index: &dyn Fn(f32) -> Option<usize>,
+        snap_to_grid: &dyn Fn(f32) -> f32,
+        sample_dragged_this_frame: &mut bool,
+        on_cross_track_move: &mut dyn FnMut(usize, usize, usize, f32),
+        on_track_drag: &mut dyn FnMut(usize, usize, f32),
+    );
+
+    fn process_active_drag(
+        ui: &mut egui::Ui,
+        grid_rect: &egui::Rect,
+        tracks: &Vec<(
+            usize,
+            String,
+            bool,
+            bool,
+            bool,
+            Vec<(usize, String, f32, f32, Vec<f32>, u32, f32, f32, f32)>,
+        )>,
+        drag_track_id: usize,
+        drag_sample_id: usize,
+        click_offset_beats: f32,
+        screen_x_to_beat: &dyn Fn(f32) -> f32,
+        screen_y_to_track_index: &dyn Fn(f32) -> Option<usize>,
+        snap_to_grid: &dyn Fn(f32) -> f32,
+        sample_dragged_this_frame: &mut bool,
+        on_cross_track_move: &mut dyn FnMut(usize, usize, usize, f32),
+        on_track_drag: &mut dyn FnMut(usize, usize, f32),
+    );
+
+    fn move_sample(
+        ui: &mut egui::Ui,
+        source_track_id: usize,
+        sample_id: usize,
+        target_track_id: usize,
+        new_position: f32,
+        click_offset_beats: f32,
+        on_cross_track_move: &mut dyn FnMut(usize, usize, usize, f32),
+        on_track_drag: &mut dyn FnMut(usize, usize, f32),
+    );
+
+    fn end_sample_drag(ui: &mut egui::Ui);
+}
+
 impl<'a> Grid<'a> {
     fn draw(&mut self, ui: &mut egui::Ui) {
         // Declare selection_drag_start using ui.memory_mut, storing Option<(usize, f32)> directly
@@ -666,7 +768,7 @@ impl<'a> Grid<'a> {
 
         // Check if we have a dragged sample from previous frames, and the mouse button is still down
         if let Some((drag_track_id, drag_sample_id, click_offset_beats)) = dragged_sample {
-            Self::handle_sample_dragging(
+            <Self as SampleDragging>::handle_sample_dragging(
                 ui,
                 &grid_rect,
                 &self.tracks,
@@ -684,7 +786,7 @@ impl<'a> Grid<'a> {
 
         // --- Handle Grid Background Interaction for Selection ---
         if !clicked_on_sample_in_track {
-            Self::handle_grid_selection(
+            <Self as GridSelection>::handle_grid_selection(
                 ui,
                 &grid_response,
                 &screen_x_to_beat,
@@ -882,299 +984,7 @@ impl<'a> Grid<'a> {
         self.v_scroll_offset = v_scroll_offset;
     }
 
-    /// Handle the selection interactions on the grid background
-    fn handle_grid_selection(
-        ui: &mut egui::Ui,
-        grid_response: &egui::Response,
-        screen_x_to_beat: &dyn Fn(f32) -> f32,
-        screen_y_to_track_index: &dyn Fn(f32) -> Option<usize>,
-        snap_to_grid: &dyn Fn(f32) -> f32,
-        selection_drag_start: &mut Option<(usize, f32)>,
-        on_selection_change: &mut dyn FnMut(Option<SelectionRect>),
-    ) {
-        // Handle selection drag start
-        if grid_response.drag_started_by(egui::PointerButton::Primary) {
-            Self::start_selection_drag(
-                ui,
-                grid_response,
-                screen_x_to_beat,
-                screen_y_to_track_index,
-                snap_to_grid,
-                selection_drag_start,
-                on_selection_change,
-            );
-        }
-
-        // Handle ongoing selection drag
-        if grid_response.dragged_by(egui::PointerButton::Primary) {
-            Self::update_selection_during_drag(
-                grid_response,
-                *selection_drag_start, // Pass the current value
-                screen_x_to_beat,
-                screen_y_to_track_index,
-                snap_to_grid,
-                on_selection_change,
-            );
-        }
-
-        // Handle drag release
-        if grid_response.drag_released_by(egui::PointerButton::Primary) {
-            Self::end_selection_drag(ui, selection_drag_start);
-        }
-
-        // Handle single click (not part of drag)
-        if grid_response.clicked_by(egui::PointerButton::Primary) {
-            Self::handle_selection_click(ui, selection_drag_start, on_selection_change);
-        }
-    }
-
-    /// Start a new selection when the user begins dragging
-    fn start_selection_drag(
-        ui: &mut egui::Ui,
-        grid_response: &egui::Response,
-        screen_x_to_beat: &dyn Fn(f32) -> f32,
-        screen_y_to_track_index: &dyn Fn(f32) -> Option<usize>,
-        snap_to_grid: &dyn Fn(f32) -> f32,
-        selection_drag_start: &mut Option<(usize, f32)>,
-        on_selection_change: &mut dyn FnMut(Option<SelectionRect>),
-    ) {
-        if let Some(pointer_pos) = grid_response.interact_pointer_pos() {
-            if let Some(start_track_idx) = screen_y_to_track_index(pointer_pos.y) {
-                // Get the beat position and snap to grid
-                let raw_start_beat = screen_x_to_beat(pointer_pos.x);
-                let start_beat = snap_to_grid(raw_start_beat);
-
-                // Store the selection start both in UI memory and local variable
-                ui.memory_mut(|mem| {
-                    *mem.data
-                        .get_persisted_mut_or_default::<Option<(usize, f32)>>(
-                            ui.id().with("selection_drag_start"),
-                        ) = Some((start_track_idx, start_beat));
-                });
-                *selection_drag_start = Some((start_track_idx, start_beat));
-
-                // Clear any existing selection when starting a new drag
-                on_selection_change(None);
-            }
-        }
-    }
-
-    /// Update the selection as the user drags
-    fn update_selection_during_drag(
-        grid_response: &egui::Response,
-        selection_start: Option<(usize, f32)>,
-        screen_x_to_beat: &dyn Fn(f32) -> f32,
-        screen_y_to_track_index: &dyn Fn(f32) -> Option<usize>,
-        snap_to_grid: &dyn Fn(f32) -> f32,
-        on_selection_change: &mut dyn FnMut(Option<SelectionRect>),
-    ) {
-        if let (Some((start_idx, start_beat)), Some(current_pos)) =
-            (selection_start, grid_response.interact_pointer_pos())
-        {
-            if let Some(current_idx) = screen_y_to_track_index(current_pos.y) {
-                // Get current position and snap to grid
-                let raw_current_beat = screen_x_to_beat(current_pos.x);
-                let current_beat = snap_to_grid(raw_current_beat);
-
-                // Calculate selection rectangle dimensions
-                // (ensure start is always before end)
-                let final_start_idx = start_idx.min(current_idx);
-                let final_end_idx = start_idx.max(current_idx);
-                let final_start_beat = start_beat.min(current_beat);
-                let final_end_beat = start_beat.max(current_beat);
-
-                // Create and update selection if it has a meaningful size
-                if (final_end_beat - final_start_beat).abs() > 0.01 {
-                    let selection = SelectionRect {
-                        start_track_idx: final_start_idx,
-                        start_beat: final_start_beat,
-                        end_track_idx: final_end_idx,
-                        end_beat: final_end_beat,
-                    };
-                    on_selection_change(Some(selection));
-                } else {
-                    // Selection too small, clear it
-                    on_selection_change(None);
-                }
-            } else {
-                // Dragged outside of track area, clear selection
-                on_selection_change(None);
-            }
-        }
-    }
-
-    /// End the selection process when mouse is released
-    fn end_selection_drag(ui: &mut egui::Ui, selection_drag_start: &mut Option<(usize, f32)>) {
-        // Clear stored selection start
-        ui.memory_mut(|mem| {
-            *mem.data
-                .get_persisted_mut_or_default::<Option<(usize, f32)>>(
-                    ui.id().with("selection_drag_start"),
-                ) = None;
-        });
-        *selection_drag_start = None;
-    }
-
-    /// Handle click that isn't part of a drag operation
-    fn handle_selection_click(
-        ui: &mut egui::Ui,
-        selection_drag_start: &mut Option<(usize, f32)>,
-        on_selection_change: &mut dyn FnMut(Option<SelectionRect>),
-    ) {
-        // If there's no drag in progress, clear selection on click
-        if selection_drag_start.is_none() {
-            on_selection_change(None);
-        } else {
-            // Should never happen - reset for safety
-            ui.memory_mut(|mem| {
-                *mem.data
-                    .get_persisted_mut_or_default::<Option<(usize, f32)>>(
-                        ui.id().with("selection_drag_start"),
-                    ) = None;
-            });
-            *selection_drag_start = None;
-        }
-    }
-
-    /// Handle ongoing sample dragging between tracks
-    fn handle_sample_dragging(
-        ui: &mut egui::Ui,
-        grid_rect: &egui::Rect,
-        tracks: &Vec<(
-            usize,
-            String,
-            bool,
-            bool,
-            bool,
-            Vec<(usize, String, f32, f32, Vec<f32>, u32, f32, f32, f32)>,
-        )>,
-        drag_track_id: usize,
-        drag_sample_id: usize,
-        click_offset_beats: f32,
-        screen_x_to_beat: &dyn Fn(f32) -> f32,
-        screen_y_to_track_index: &dyn Fn(f32) -> Option<usize>,
-        snap_to_grid: &dyn Fn(f32) -> f32,
-        sample_dragged_this_frame: &mut bool,
-        on_cross_track_move: &mut dyn FnMut(usize, usize, usize, f32),
-        on_track_drag: &mut dyn FnMut(usize, usize, f32),
-    ) {
-        if ui.input(|i| i.pointer.primary_down()) {
-            // Only proceed if mouse button is still down
-            Self::process_active_drag(
-                ui,
-                grid_rect,
-                tracks,
-                drag_track_id,
-                drag_sample_id,
-                click_offset_beats,
-                screen_x_to_beat,
-                screen_y_to_track_index,
-                snap_to_grid,
-                sample_dragged_this_frame,
-                on_cross_track_move,
-                on_track_drag,
-            );
-        } else {
-            // Mouse button released, clear the dragged sample
-            Self::end_sample_drag(ui);
-        }
-    }
-
-    /// Process an active drag operation (mouse button is down)
-    fn process_active_drag(
-        ui: &mut egui::Ui,
-        grid_rect: &egui::Rect,
-        tracks: &Vec<(
-            usize,
-            String,
-            bool,
-            bool,
-            bool,
-            Vec<(usize, String, f32, f32, Vec<f32>, u32, f32, f32, f32)>,
-        )>,
-        drag_track_id: usize,
-        drag_sample_id: usize,
-        click_offset_beats: f32,
-        screen_x_to_beat: &dyn Fn(f32) -> f32,
-        screen_y_to_track_index: &dyn Fn(f32) -> Option<usize>,
-        snap_to_grid: &dyn Fn(f32) -> f32,
-        sample_dragged_this_frame: &mut bool,
-        on_cross_track_move: &mut dyn FnMut(usize, usize, usize, f32),
-        on_track_drag: &mut dyn FnMut(usize, usize, f32),
-    ) {
-        // Get current mouse position
-        if let Some(pointer_pos) = ui.input(|i| i.pointer.interact_pos()) {
-            // Check if the mouse is over a valid track
-            if let Some(target_track_idx) = screen_y_to_track_index(pointer_pos.y) {
-                // Calculate new position in beats
-                let pointer_beat_position = screen_x_to_beat(pointer_pos.x);
-                let new_beat_position = pointer_beat_position - click_offset_beats;
-                let snapped_position = snap_to_grid(new_beat_position);
-
-                // Get target track id
-                let target_track_id = tracks[target_track_idx].0;
-
-                // Find the source track index
-                if let Some(_) = tracks
-                    .iter()
-                    .position(|(id, _, _, _, _, _)| *id == drag_track_id)
-                {
-                    Self::move_sample(
-                        ui,
-                        drag_track_id,
-                        drag_sample_id,
-                        target_track_id,
-                        snapped_position,
-                        click_offset_beats,
-                        on_cross_track_move,
-                        on_track_drag,
-                    );
-                    *sample_dragged_this_frame = true;
-                }
-            }
-        }
-    }
-
-    /// Move a sample within the same track or to a different track
-    fn move_sample(
-        ui: &mut egui::Ui,
-        source_track_id: usize,
-        sample_id: usize,
-        target_track_id: usize,
-        new_position: f32,
-        click_offset_beats: f32,
-        on_cross_track_move: &mut dyn FnMut(usize, usize, usize, f32),
-        on_track_drag: &mut dyn FnMut(usize, usize, f32),
-    ) {
-        // If target track is different from source track, move between tracks
-        if target_track_id != source_track_id {
-            // Cross-track movement
-            on_cross_track_move(source_track_id, sample_id, target_track_id, new_position);
-
-            // Update the dragged sample reference to the new track
-            ui.memory_mut(|mem| {
-                *mem.data
-                    .get_persisted_mut_or_default::<Option<(usize, usize, f32)>>(
-                        ui.id().with("dragged_sample"),
-                    ) = Some((target_track_id, sample_id, click_offset_beats));
-            });
-        } else {
-            // Move within the same track
-            on_track_drag(source_track_id, sample_id, new_position);
-        }
-    }
-
-    /// End a sample drag operation when mouse is released
-    fn end_sample_drag(ui: &mut egui::Ui) {
-        // Clear the dragged sample reference
-        ui.memory_mut(|mem| {
-            *mem.data
-                .get_persisted_mut_or_default::<Option<(usize, usize, f32)>>(
-                    ui.id().with("dragged_sample"),
-                ) = None;
-        });
-    }
-
+    // Keep draw_sample in the main impl because it's fundamental to the Grid functionality
     fn draw_sample(
         ui: &mut egui::Ui,
         grid_rect: &egui::Rect,
@@ -1353,6 +1163,296 @@ impl<'a> Grid<'a> {
                 *sample_dragged_this_frame = true;
             }
         }
+    }
+}
+
+// Implement the GridSelection trait for Grid
+impl<'a> GridSelection for Grid<'a> {
+    fn handle_grid_selection(
+        ui: &mut egui::Ui,
+        grid_response: &egui::Response,
+        screen_x_to_beat: &dyn Fn(f32) -> f32,
+        screen_y_to_track_index: &dyn Fn(f32) -> Option<usize>,
+        snap_to_grid: &dyn Fn(f32) -> f32,
+        selection_drag_start: &mut Option<(usize, f32)>,
+        on_selection_change: &mut dyn FnMut(Option<SelectionRect>),
+    ) {
+        // Handle selection drag start
+        if grid_response.drag_started_by(egui::PointerButton::Primary) {
+            Self::start_selection_drag(
+                ui,
+                grid_response,
+                screen_x_to_beat,
+                screen_y_to_track_index,
+                snap_to_grid,
+                selection_drag_start,
+                on_selection_change,
+            );
+        }
+
+        // Handle ongoing selection drag
+        if grid_response.dragged_by(egui::PointerButton::Primary) {
+            Self::update_selection_during_drag(
+                grid_response,
+                *selection_drag_start, // Pass the current value
+                screen_x_to_beat,
+                screen_y_to_track_index,
+                snap_to_grid,
+                on_selection_change,
+            );
+        }
+
+        // Handle drag release
+        if grid_response.drag_released_by(egui::PointerButton::Primary) {
+            Self::end_selection_drag(ui, selection_drag_start);
+        }
+
+        // Handle single click (not part of drag)
+        if grid_response.clicked_by(egui::PointerButton::Primary) {
+            Self::handle_selection_click(ui, selection_drag_start, on_selection_change);
+        }
+    }
+
+    fn start_selection_drag(
+        ui: &mut egui::Ui,
+        grid_response: &egui::Response,
+        screen_x_to_beat: &dyn Fn(f32) -> f32,
+        screen_y_to_track_index: &dyn Fn(f32) -> Option<usize>,
+        snap_to_grid: &dyn Fn(f32) -> f32,
+        selection_drag_start: &mut Option<(usize, f32)>,
+        on_selection_change: &mut dyn FnMut(Option<SelectionRect>),
+    ) {
+        if let Some(pointer_pos) = grid_response.interact_pointer_pos() {
+            if let Some(start_track_idx) = screen_y_to_track_index(pointer_pos.y) {
+                // Get the beat position and snap to grid
+                let raw_start_beat = screen_x_to_beat(pointer_pos.x);
+                let start_beat = snap_to_grid(raw_start_beat);
+
+                // Store the selection start both in UI memory and local variable
+                ui.memory_mut(|mem| {
+                    *mem.data
+                        .get_persisted_mut_or_default::<Option<(usize, f32)>>(
+                            ui.id().with("selection_drag_start"),
+                        ) = Some((start_track_idx, start_beat));
+                });
+                *selection_drag_start = Some((start_track_idx, start_beat));
+
+                // Clear any existing selection when starting a new drag
+                on_selection_change(None);
+            }
+        }
+    }
+
+    fn update_selection_during_drag(
+        grid_response: &egui::Response,
+        selection_start: Option<(usize, f32)>,
+        screen_x_to_beat: &dyn Fn(f32) -> f32,
+        screen_y_to_track_index: &dyn Fn(f32) -> Option<usize>,
+        snap_to_grid: &dyn Fn(f32) -> f32,
+        on_selection_change: &mut dyn FnMut(Option<SelectionRect>),
+    ) {
+        if let (Some((start_idx, start_beat)), Some(current_pos)) =
+            (selection_start, grid_response.interact_pointer_pos())
+        {
+            if let Some(current_idx) = screen_y_to_track_index(current_pos.y) {
+                // Get current position and snap to grid
+                let raw_current_beat = screen_x_to_beat(current_pos.x);
+                let current_beat = snap_to_grid(raw_current_beat);
+
+                // Calculate selection rectangle dimensions
+                // (ensure start is always before end)
+                let final_start_idx = start_idx.min(current_idx);
+                let final_end_idx = start_idx.max(current_idx);
+                let final_start_beat = start_beat.min(current_beat);
+                let final_end_beat = start_beat.max(current_beat);
+
+                // Create and update selection if it has a meaningful size
+                if (final_end_beat - final_start_beat).abs() > 0.01 {
+                    let selection = SelectionRect {
+                        start_track_idx: final_start_idx,
+                        start_beat: final_start_beat,
+                        end_track_idx: final_end_idx,
+                        end_beat: final_end_beat,
+                    };
+                    on_selection_change(Some(selection));
+                } else {
+                    // Selection too small, clear it
+                    on_selection_change(None);
+                }
+            } else {
+                // Dragged outside of track area, clear selection
+                on_selection_change(None);
+            }
+        }
+    }
+
+    fn end_selection_drag(ui: &mut egui::Ui, selection_drag_start: &mut Option<(usize, f32)>) {
+        // Clear stored selection start
+        ui.memory_mut(|mem| {
+            *mem.data
+                .get_persisted_mut_or_default::<Option<(usize, f32)>>(
+                    ui.id().with("selection_drag_start"),
+                ) = None;
+        });
+        *selection_drag_start = None;
+    }
+
+    fn handle_selection_click(
+        ui: &mut egui::Ui,
+        selection_drag_start: &mut Option<(usize, f32)>,
+        on_selection_change: &mut dyn FnMut(Option<SelectionRect>),
+    ) {
+        // If there's no drag in progress, clear selection on click
+        if selection_drag_start.is_none() {
+            on_selection_change(None);
+        } else {
+            // Should never happen - reset for safety
+            ui.memory_mut(|mem| {
+                *mem.data
+                    .get_persisted_mut_or_default::<Option<(usize, f32)>>(
+                        ui.id().with("selection_drag_start"),
+                    ) = None;
+            });
+            *selection_drag_start = None;
+        }
+    }
+}
+
+// Implement the SampleDragging trait for Grid
+impl<'a> SampleDragging for Grid<'a> {
+    fn handle_sample_dragging(
+        ui: &mut egui::Ui,
+        grid_rect: &egui::Rect,
+        tracks: &Vec<(
+            usize,
+            String,
+            bool,
+            bool,
+            bool,
+            Vec<(usize, String, f32, f32, Vec<f32>, u32, f32, f32, f32)>,
+        )>,
+        drag_track_id: usize,
+        drag_sample_id: usize,
+        click_offset_beats: f32,
+        screen_x_to_beat: &dyn Fn(f32) -> f32,
+        screen_y_to_track_index: &dyn Fn(f32) -> Option<usize>,
+        snap_to_grid: &dyn Fn(f32) -> f32,
+        sample_dragged_this_frame: &mut bool,
+        on_cross_track_move: &mut dyn FnMut(usize, usize, usize, f32),
+        on_track_drag: &mut dyn FnMut(usize, usize, f32),
+    ) {
+        if ui.input(|i| i.pointer.primary_down()) {
+            // Only proceed if mouse button is still down
+            Self::process_active_drag(
+                ui,
+                grid_rect,
+                tracks,
+                drag_track_id,
+                drag_sample_id,
+                click_offset_beats,
+                screen_x_to_beat,
+                screen_y_to_track_index,
+                snap_to_grid,
+                sample_dragged_this_frame,
+                on_cross_track_move,
+                on_track_drag,
+            );
+        } else {
+            // Mouse button released, clear the dragged sample
+            Self::end_sample_drag(ui);
+        }
+    }
+
+    fn process_active_drag(
+        ui: &mut egui::Ui,
+        grid_rect: &egui::Rect,
+        tracks: &Vec<(
+            usize,
+            String,
+            bool,
+            bool,
+            bool,
+            Vec<(usize, String, f32, f32, Vec<f32>, u32, f32, f32, f32)>,
+        )>,
+        drag_track_id: usize,
+        drag_sample_id: usize,
+        click_offset_beats: f32,
+        screen_x_to_beat: &dyn Fn(f32) -> f32,
+        screen_y_to_track_index: &dyn Fn(f32) -> Option<usize>,
+        snap_to_grid: &dyn Fn(f32) -> f32,
+        sample_dragged_this_frame: &mut bool,
+        on_cross_track_move: &mut dyn FnMut(usize, usize, usize, f32),
+        on_track_drag: &mut dyn FnMut(usize, usize, f32),
+    ) {
+        // Get current mouse position
+        if let Some(pointer_pos) = ui.input(|i| i.pointer.interact_pos()) {
+            // Check if the mouse is over a valid track
+            if let Some(target_track_idx) = screen_y_to_track_index(pointer_pos.y) {
+                // Calculate new position in beats
+                let pointer_beat_position = screen_x_to_beat(pointer_pos.x);
+                let new_beat_position = pointer_beat_position - click_offset_beats;
+                let snapped_position = snap_to_grid(new_beat_position);
+
+                // Get target track id
+                let target_track_id = tracks[target_track_idx].0;
+
+                // Find the source track index
+                if let Some(_) = tracks
+                    .iter()
+                    .position(|(id, _, _, _, _, _)| *id == drag_track_id)
+                {
+                    Self::move_sample(
+                        ui,
+                        drag_track_id,
+                        drag_sample_id,
+                        target_track_id,
+                        snapped_position,
+                        click_offset_beats,
+                        on_cross_track_move,
+                        on_track_drag,
+                    );
+                    *sample_dragged_this_frame = true;
+                }
+            }
+        }
+    }
+
+    fn move_sample(
+        ui: &mut egui::Ui,
+        source_track_id: usize,
+        sample_id: usize,
+        target_track_id: usize,
+        new_position: f32,
+        click_offset_beats: f32,
+        on_cross_track_move: &mut dyn FnMut(usize, usize, usize, f32),
+        on_track_drag: &mut dyn FnMut(usize, usize, f32),
+    ) {
+        // If target track is different from source track, move between tracks
+        if target_track_id != source_track_id {
+            // Cross-track movement
+            on_cross_track_move(source_track_id, sample_id, target_track_id, new_position);
+
+            // Update the dragged sample reference to the new track
+            ui.memory_mut(|mem| {
+                *mem.data
+                    .get_persisted_mut_or_default::<Option<(usize, usize, f32)>>(
+                        ui.id().with("dragged_sample"),
+                    ) = Some((target_track_id, sample_id, click_offset_beats));
+            });
+        } else {
+            // Move within the same track
+            on_track_drag(source_track_id, sample_id, new_position);
+        }
+    }
+
+    fn end_sample_drag(ui: &mut egui::Ui) {
+        // Clear the dragged sample reference
+        ui.memory_mut(|mem| {
+            *mem.data
+                .get_persisted_mut_or_default::<Option<(usize, usize, f32)>>(
+                    ui.id().with("dragged_sample"),
+                ) = None;
+        });
     }
 }
 
