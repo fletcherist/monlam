@@ -412,6 +412,7 @@ impl<'a> Grid<'a> {
         let first_visible_beat = (h_scroll_offset * beats_per_second).floor() as i32;
         let last_visible_beat = (first_visible_beat as f32 + num_visible_beats).ceil() as i32;
 
+        // Draw main grid lines
         for beat in first_visible_beat..last_visible_beat {
             let beat_pos = beat as f32 / beats_per_second;
             let x = grid_rect.left() + (beat_pos - h_scroll_offset) / seconds_per_pixel;
@@ -437,6 +438,33 @@ impl<'a> Grid<'a> {
                     egui::FontId::proportional(10.0),
                     Color32::from_rgb(150, 150, 150),
                 );
+            }
+
+            // Draw subdivision grid lines with 0.5 opacity for better snapping visualization
+            let subdivisions = (1.0 / self.grid_division).floor() as i32;
+            if subdivisions > 1 {
+                for i in 1..subdivisions {
+                    let subdivision_pos = beat as f32 + (i as f32 / subdivisions as f32);
+                    let subdivision_pos_seconds = subdivision_pos / beats_per_second;
+                    let subdivision_x = grid_rect.left()
+                        + (subdivision_pos_seconds - h_scroll_offset) / seconds_per_pixel;
+
+                    // Create a color with 0.5 opacity
+                    let mut subdivision_color = if beat % 4 == 0 {
+                        BAR_LINE_COLOR
+                    } else {
+                        BEAT_LINE_COLOR
+                    };
+                    subdivision_color = subdivision_color.linear_multiply(0.5); // Reduce opacity
+
+                    painter.line_segment(
+                        [
+                            egui::Pos2::new(subdivision_x, grid_rect.top()),
+                            egui::Pos2::new(subdivision_x, grid_rect.bottom()),
+                        ],
+                        Stroke::new(0.5, subdivision_color), // Thinner line for subdivisions
+                    );
+                }
             }
         }
 
@@ -755,9 +783,10 @@ impl<'a> Grid<'a> {
                         let time_delta = delta * seconds_per_pixel;
                         let beat_delta = time_delta * beats_per_second;
                         let new_position = *position + beat_delta;
+                        let snapped_position = snap_to_grid(new_position); // Snap to grid just like area selection
 
                         // We'll only use this for within-track drags, as between-track drags are handled above
-                        (self.on_track_drag)(*track_id, *sample_id, new_position);
+                        (self.on_track_drag)(*track_id, *sample_id, snapped_position);
                         sample_dragged_this_frame = true;
                     }
                 }
@@ -773,6 +802,7 @@ impl<'a> Grid<'a> {
                     if let Some(target_track_idx) = screen_y_to_track_index(pointer_pos.y) {
                         let pointer_beat_position = screen_x_to_beat(pointer_pos.x);
                         let new_beat_position = pointer_beat_position - click_offset_beats;
+                        let snapped_position = snap_to_grid(new_beat_position); // Snap to grid just like area selection
 
                         // Get target track id
                         let target_track_id = self.tracks[target_track_idx].0;
@@ -790,7 +820,7 @@ impl<'a> Grid<'a> {
                                     drag_track_id,
                                     drag_sample_id,
                                     target_track_id,
-                                    new_beat_position,
+                                    snapped_position,
                                 );
 
                                 // Update the dragged sample to the new track, maintaining the offset
@@ -804,7 +834,7 @@ impl<'a> Grid<'a> {
                                 (self.on_track_drag)(
                                     drag_track_id,
                                     drag_sample_id,
-                                    new_beat_position,
+                                    snapped_position,
                                 );
                             }
 
