@@ -1,5 +1,7 @@
 use crate::daw::{DawAction, DawApp, SelectionRect};
 use crate::ui::grid::Grid;
+use crate::ui::file_browser::FileBrowserPanel;
+use crate::ui::drag_drop;
 use eframe::egui;
 use egui::{Color32, Key, RichText, Stroke};
 use rfd::FileDialog;
@@ -367,6 +369,23 @@ impl eframe::App for DawApp {
         // Update timeline position based on audio playback
         self.update_playback();
 
+        // Handle drag and drop operations
+        
+        // Filter dragged files to only include audio files
+        drag_drop::filter_dragged_audio_files(ctx);
+        
+        // Check if any drag operation is active (internal or external)
+        let drag_active = drag_drop::is_drag_active(ctx);
+        
+        // Draw the drop overlay if needed
+        drag_drop::draw_drop_overlay(ctx, drag_active);
+        
+        // Handle external file drops (from OS)
+        drag_drop::handle_external_file_drop(self, ctx);
+        
+        // Handle internal file drops (from file browser)
+        drag_drop::handle_internal_file_drop(self, ctx);
+
         // Store state values locally to use in UI closures
         let is_playing = self.state.is_playing;
         let timeline_position = self.state.timeline_position;
@@ -725,6 +744,53 @@ impl eframe::App for DawApp {
                 }
                 .draw(ui);
             });
+        });
+
+        // Create a file browser panel structure with the project directory
+        let mut file_browser = if let Some(stored_browser) = ctx.memory(|mem| mem.data.get_temp::<FileBrowserPanel>(egui::Id::new("file_browser"))) {
+            stored_browser
+        } else {
+            // Get the current project folder from the state.file_path
+            let project_folder = self.state.file_path.as_ref()
+                .and_then(|path| path.parent())
+                .map(|path| path.to_path_buf());
+            
+            FileBrowserPanel::new(project_folder.as_deref())
+        };
+        
+        // Draw file browser panel
+        egui::SidePanel::left("file_browser_panel")
+            .default_width(200.0)
+            .show_animated(ctx, file_browser.get_show_panel(), |ui| {
+                ui.horizontal(|ui| {
+                    ui.heading("Project Files");
+                    ui.add_space(ui.available_width() - 100.0);
+                    if ui.button("⟳").clicked() {
+                        // If the project path has changed, update the file browser
+                        let project_folder = self.state.file_path.as_ref()
+                            .and_then(|path| path.parent())
+                            .map(|path| path.to_path_buf());
+                        
+                        if let Some(project_path) = project_folder.as_deref() {
+                            if !file_browser.is_current_folder(project_path) {
+                                file_browser = FileBrowserPanel::new(Some(project_path));
+                            } else {
+                                file_browser.refresh();
+                            }
+                        } else {
+                            file_browser.refresh();
+                        }
+                    }
+                    if ui.button("⬆").clicked() {
+                        file_browser.navigate_up();
+                    }
+                });
+                file_browser.draw(ui, ctx);
+            });
+        
+        // Store the updated file browser
+        ctx.memory_mut(|mem| {
+            mem.data.insert_temp(egui::Id::new("file_browser"), file_browser);
         });
 
         // Process the collected actions

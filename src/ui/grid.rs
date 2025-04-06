@@ -387,11 +387,19 @@ impl<'a> Grid<'a> {
             }
         }
 
-        // Main grid area
+        // Allocate the grid area
         let (grid_rect, grid_response) = ui.allocate_exact_size(
             egui::Vec2::new(actual_width, visible_height),
             egui::Sense::click_and_drag(),
         );
+
+        // Store the grid rect in memory for drag and drop functionality
+        ui.ctx().memory_mut(|mem| {
+            mem.data.insert_temp(egui::Id::new("grid_rect"), grid_rect);
+            
+            // Debug output to verify the grid rect is being stored
+            eprintln!("Grid rect stored: {:?}", grid_rect);
+        });
 
         // --- Define Coordinate Helper Functions HERE (Moved Earlier) ---
         let screen_x_to_beat = move |screen_x: f32| -> f32 {

@@ -15,12 +15,14 @@
 [] - cmd + l should enable/disable loop mode
 
 
-
+2025-04-06
 [x] - cmd + s for saving project
-[] - show files in a current project folder
+[x] - show files in a current project folder
+[x] - drag audio files directly to the grid
+[] - side panel should be in sync by width with the grid
+
 [] - store waveforms not in .monlam folder but in project folder in .monlam folder
-
-
+[] - investigate why .mp3 files loading took so long
 [] - fix: zoom is implemented via alt, replace with cmd
 
 
