@@ -301,6 +301,50 @@ impl<'a> TrackControls<'a> {
     }
 }
 
+struct TabsBar<'a> {
+    tabs: Vec<(usize, String, bool, bool)>, // id, name, is_active, is_audio_box
+    on_tab_select: &'a mut dyn FnMut(usize),
+    on_tab_close: &'a mut dyn FnMut(usize),
+}
+
+impl<'a> TabsBar<'a> {
+    pub fn draw(mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            for (id, name, is_active, is_audio_box) in &self.tabs {
+                // Create a styled button for each tab
+                let button_text = if *is_audio_box {
+                    format!("📦 {}", name)
+                } else {
+                    format!("📄 {}", name)
+                };
+                
+                // Use different styling for active tab
+                let mut button = egui::Button::new(button_text);
+                if *is_active {
+                    button = button.fill(egui::Color32::from_rgb(60, 70, 90));
+                }
+                
+                // Add the tab button
+                let tab_response = ui.add(button);
+                
+                if tab_response.clicked() {
+                    (self.on_tab_select)(*id);
+                }
+                
+                // Add close button for all tabs except the main one (id 0)
+                if *id != 0 {
+                    // Close button next to tab
+                    if ui.small_button("✕").clicked() {
+                        (self.on_tab_close)(*id);
+                    }
+                }
+                
+                ui.add_space(2.0);
+            }
+        });
+    }
+}
+
 impl eframe::App for DawApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Set dark theme
@@ -396,92 +440,229 @@ impl eframe::App for DawApp {
         let grid_division = self.state.grid_division;
         let last_clicked_bar = self.state.last_clicked_bar;
 
-        // Create track info to avoid borrowing self in closures
-        let track_info: Vec<_> = self
-            .state
-            .tracks
-            .iter()
-            .map(|track| {
-                let samples_info: Vec<_> = track
-                    .samples
-                    .iter()
-                    .map(|sample| {
-                        let (waveform_data, sample_rate) = sample
-                            .waveform
-                            .as_ref()
-                            .map(|w| (w.samples.clone(), w.sample_rate))
-                            .unwrap_or((vec![], 44100));
+        // Check if we're in an audio box tab or the main project tab
+        let active_tab = self.state.tabs.iter().find(|t| t.id == self.state.active_tab_id);
+        let is_audio_box_tab = active_tab.map_or(false, |tab| tab.is_audio_box);
+        let audio_box_name = active_tab.and_then(|tab| tab.audio_box_name.clone());
+        
+        // Prepare track info based on active tab
+        let track_info: Vec<_>;
+        
+        if is_audio_box_tab {
+            // Create a temporary track for the audio box
+            let mut temp_tracks = Vec::new();
+            
+            if let Some(box_name) = &audio_box_name {
+                // Load the AudioBox data from disk
+                if let Some(project_path) = self.state.file_path.as_ref() {
+                    if let Some(project_dir) = project_path.parent() {
+                        let box_path = project_dir.join(box_name);
+                        let render_path = box_path.join("render.wav");
+                        
+                        if render_path.exists() {
+                            // Try to load audio file to get waveform data
+                            if let Ok((samples, rate)) = crate::audio::load_audio(&render_path) {
+                                // Generate waveform data
+                                let duration = samples.len() as f32 / rate as f32;
+                                
+                                // Downsample for waveform
+                                let downsample_factor = samples.len() / 1000;
+                                let waveform_data: Vec<f32> = samples
+                                    .chunks(downsample_factor.max(1))
+                                    .map(|chunk| chunk.iter().map(|&s| s.abs()).fold(0.0, f32::max))
+                                    .collect();
+                                
+                                // Create a sample info entry representing the audio box
+                                let sample_info = (
+                                    0, // sample id
+                                    box_name.clone(),
+                                    0.0, // position
+                                    duration * (bpm / 60.0), // length in beats
+                                    waveform_data,
+                                    rate,
+                                    duration,
+                                    0.0, // audio_start_time
+                                    duration, // audio_end_time
+                                    TrackItemType::AudioBox,
+                                );
+                                
+                                // Add the temporary track with the audio box
+                                temp_tracks.push((
+                                    0, // track id
+                                    format!("Box: {}", box_name),
+                                    false, // muted
+                                    false, // soloed
+                                    false, // recording
+                                    vec![sample_info], // samples
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+            
+            // If we couldn't load the audio box, still provide an empty track
+            if temp_tracks.is_empty() {
+                temp_tracks.push((
+                    0,
+                    "Empty Track".to_string(),
+                    false,
+                    false,
+                    false,
+                    Vec::new(),
+                ));
+            }
+            
+            track_info = temp_tracks;
+        } else {
+            // Use the main project tracks
+            track_info = self
+                .state
+                .tracks
+                .iter()
+                .map(|track| {
+                    let samples_info: Vec<_> = track
+                        .samples
+                        .iter()
+                        .map(|sample| {
+                            let (waveform_data, sample_rate) = sample
+                                .waveform
+                                .as_ref()
+                                .map(|w| (w.samples.clone(), w.sample_rate))
+                                .unwrap_or((vec![], 44100));
 
-                        // Get the full audio duration
-                        let full_duration =
-                            sample.waveform.as_ref().map(|w| w.duration).unwrap_or(0.0);
+                            // Get the full audio duration
+                            let full_duration =
+                                sample.waveform.as_ref().map(|w| w.duration).unwrap_or(0.0);
 
-                        // Use trim points for the visual representation
-                        let audio_start_time = sample.trim_start;
-                        let audio_end_time = if sample.trim_end <= 0.0 {
-                            full_duration
-                        } else {
-                            sample.trim_end
-                        };
+                            // Use trim points for the visual representation
+                            let audio_start_time = sample.trim_start;
+                            let audio_end_time = if sample.trim_end <= 0.0 {
+                                full_duration
+                            } else {
+                                sample.trim_end
+                            };
 
-                        (
-                            sample.id,
-                            sample.name.clone(),
-                            sample.grid_position,
-                            sample.grid_length,
-                            waveform_data,
-                            sample_rate,
-                            full_duration,
-                            audio_start_time,
-                            audio_end_time,
-                            sample.item_type,
-                        )
-                    })
-                    .collect();
+                            (
+                                sample.id,
+                                sample.name.clone(),
+                                sample.grid_position,
+                                sample.grid_length,
+                                waveform_data,
+                                sample_rate,
+                                full_duration,
+                                audio_start_time,
+                                audio_end_time,
+                                sample.item_type,
+                            )
+                        })
+                        .collect();
 
-                (
-                    track.id,
-                    track.name.clone(),
-                    track.muted,
-                    track.soloed,
-                    track.recording,
-                    samples_info,
-                )
-            })
-            .collect();
+                    (
+                        track.id,
+                        track.name.clone(),
+                        track.muted,
+                        track.soloed,
+                        track.recording,
+                        samples_info,
+                    )
+                })
+                .collect();
+        }
 
-        let track_controls_info: Vec<_> = self
-            .state
-            .tracks
-            .iter()
-            .map(|track| {
-                let samples_info: Vec<_> = track
-                    .samples
-                    .iter()
-                    .map(|sample| {
-                        (
-                            sample.id,
-                            sample.name.clone(),
-                            sample.grid_position,
-                            sample.grid_length,
-                            sample.current_position,
-                            sample.waveform.as_ref().map_or(0.0, |w| w.duration),
-                            sample.trim_start,
-                            sample.trim_end,
-                        )
-                    })
-                    .collect();
+        // Prepare controls info based on active tab
+        let track_controls_info: Vec<_>;
+        
+        if is_audio_box_tab {
+            // For audio box tabs, create matching controls for our temporary tracks
+            let mut temp_controls = Vec::new();
+            
+            if let Some(box_name) = &audio_box_name {
+                // Get audio data for duration
+                let mut duration = 0.0;
+                
+                if let Some(project_path) = self.state.file_path.as_ref() {
+                    if let Some(project_dir) = project_path.parent() {
+                        let box_path = project_dir.join(box_name);
+                        let render_path = box_path.join("render.wav");
+                        
+                        if render_path.exists() {
+                            if let Ok((samples, rate)) = crate::audio::load_audio(&render_path) {
+                                duration = samples.len() as f32 / rate as f32;
+                            }
+                        }
+                    }
+                }
+                
+                // Create a sample entry
+                let sample_info = (
+                    0, // sample id
+                    box_name.clone(),
+                    0.0, // position
+                    duration * (bpm / 60.0), // length in beats
+                    0.0, // current position
+                    duration, // duration
+                    0.0, // trim_start
+                    0.0, // trim_end
+                );
+                
+                // Add control for the temporary track
+                temp_controls.push((
+                    0, // track id
+                    format!("Box: {}", box_name),
+                    false, // muted
+                    false, // soloed
+                    false, // recording
+                    vec![sample_info], // samples
+                ));
+            } else {
+                // Empty track control if we don't have a box name
+                temp_controls.push((
+                    0,
+                    "Empty Track".to_string(),
+                    false,
+                    false,
+                    false,
+                    Vec::new(),
+                ));
+            }
+            
+            track_controls_info = temp_controls;
+        } else {
+            // Use the main project's track controls
+            track_controls_info = self
+                .state
+                .tracks
+                .iter()
+                .map(|track| {
+                    let samples_info: Vec<_> = track
+                        .samples
+                        .iter()
+                        .map(|sample| {
+                            (
+                                sample.id,
+                                sample.name.clone(),
+                                sample.grid_position,
+                                sample.grid_length,
+                                sample.current_position,
+                                sample.waveform.as_ref().map_or(0.0, |w| w.duration),
+                                sample.trim_start,
+                                sample.trim_end,
+                            )
+                        })
+                        .collect();
 
-                (
-                    track.id,
-                    track.name.clone(),
-                    track.muted,
-                    track.soloed,
-                    track.recording,
-                    samples_info,
-                )
-            })
-            .collect();
+                    (
+                        track.id,
+                        track.name.clone(),
+                        track.muted,
+                        track.soloed,
+                        track.recording,
+                        samples_info,
+                    )
+                })
+                .collect();
+        }
 
         // Define UI actions without capturing self
         #[derive(Clone)]
@@ -544,6 +725,9 @@ impl eframe::App for DawApp {
             DeleteAudioBox(String),
             AddBoxToTrack(usize, String),
             RenderBoxFromSelection(String),
+            OpenBoxInNewTab(String),
+            SwitchToTab(usize),
+            CloseTab(usize),
         }
 
         // Collect actions during UI rendering using Rc<RefCell>
@@ -715,12 +899,8 @@ impl eframe::App for DawApp {
                 
                 // Handle box interactions, returns an option of the box to open if any
                 if let Some(box_to_open) = audio_box_panel.draw(ui, ctx) {
-                    // When a box is opened, we add it as a sample to the first track
-                    // In a real implementation, you'd handle this differently,
-                    // possibly opening a new tab or window
-                    if let Some(first_track) = self.state.tracks.first() {
-                        actions_clone.borrow_mut().push(UiAction::AddBoxToTrack(first_track.id, box_to_open.name));
-                    }
+                    // When a box is opened, open it in a new tab with empty project and tracks
+                    actions_clone.borrow_mut().push(UiAction::OpenBoxInNewTab(box_to_open.name));
                 }
                 
                 // Handle box dragging - check if a box is being dragged
@@ -766,6 +946,26 @@ impl eframe::App for DawApp {
                 ui.add_space(8.0);
                 ui.separator();
                 ui.add_space(8.0);
+
+                // Tabs bar
+                let actions_clone = actions.clone();
+                let tabs_bar = TabsBar {
+                    tabs: self.state.tabs.iter().map(|tab| {
+                        (
+                            tab.id, 
+                            tab.name.clone(), 
+                            tab.id == self.state.active_tab_id,
+                            tab.is_audio_box
+                        )
+                    }).collect(),
+                    on_tab_select: &mut |id| {
+                        actions_clone.borrow_mut().push(UiAction::SwitchToTab(id));
+                    },
+                    on_tab_close: &mut |id| {
+                        actions_clone.borrow_mut().push(UiAction::CloseTab(id));
+                    },
+                };
+                tabs_bar.draw(ui);
 
                 // Grid in the middle
                 let actions_clone = actions.clone();
@@ -835,6 +1035,11 @@ impl eframe::App for DawApp {
                         actions_clone
                             .borrow_mut()
                             .push(UiAction::SetTimelinePosition(new_position));
+                    },
+                    on_box_double_click: &mut |_track_id, _box_id, box_name| {
+                        actions_clone
+                            .borrow_mut()
+                            .push(UiAction::OpenBoxInNewTab(box_name.to_string()));
                     },
                 };
                 grid.draw(ui);
@@ -1071,6 +1276,15 @@ impl eframe::App for DawApp {
                 UiAction::RenderBoxFromSelection(name) => {
                     self.dispatch(DawAction::RenderBoxFromSelection(name.clone()));
                 }
+                UiAction::OpenBoxInNewTab(name) => {
+                    self.dispatch(DawAction::OpenBoxInNewTab(name.clone()));
+                }
+                UiAction::SwitchToTab(tab_id) => {
+                    self.dispatch(DawAction::SwitchToTab(*tab_id));
+                }
+                UiAction::CloseTab(tab_id) => {
+                    self.dispatch(DawAction::CloseTab(*tab_id));
+                }
             }
         }
     }
@@ -1079,4 +1293,35 @@ impl eframe::App for DawApp {
         // Call the DawApp's on_exit method to ensure the project is saved
         DawApp::on_exit(self);
     }
+}
+
+// Helper function to create a downsampled waveform for visualization
+fn generate_waveform(samples: &[f32], target_size: usize) -> Vec<f32> {
+    if samples.is_empty() {
+        return Vec::new();
+    }
+    
+    let samples_per_point = (samples.len() as f32 / target_size as f32).max(1.0) as usize;
+    let mut waveform = Vec::with_capacity(target_size);
+    
+    for i in 0..target_size {
+        let start = (i * samples_per_point).min(samples.len());
+        let end = ((i + 1) * samples_per_point).min(samples.len());
+        
+        if start < end {
+            // Find the maximum amplitude in this segment
+            let mut max_amplitude = 0.0f32;
+            for j in start..end {
+                let amplitude = samples[j].abs();
+                if amplitude > max_amplitude {
+                    max_amplitude = amplitude;
+                }
+            }
+            waveform.push(max_amplitude);
+        } else {
+            break;
+        }
+    }
+    
+    waveform
 }

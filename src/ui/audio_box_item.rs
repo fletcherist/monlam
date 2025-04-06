@@ -29,6 +29,7 @@ pub fn draw_audio_box(
     snap_to_grid: &dyn Fn(f32) -> f32,
     on_selection_change: &mut dyn FnMut(Option<SelectionRect>),
     on_track_drag: &mut dyn FnMut(usize, usize, f32),
+    on_box_double_click: &mut dyn FnMut(usize, usize, &str),
 ) -> bool {
     if length <= 0.0 {
         return false;
@@ -116,6 +117,8 @@ pub fn draw_audio_box(
         snap_to_grid,
         on_selection_change,
         on_track_drag,
+        on_box_double_click,
+        box_name,
     )
 }
 
@@ -201,6 +204,8 @@ fn handle_audio_box_interaction(
     snap_to_grid: &dyn Fn(f32) -> f32,
     on_selection_change: &mut dyn FnMut(Option<SelectionRect>),
     on_track_drag: &mut dyn FnMut(usize, usize, f32),
+    on_box_double_click: &mut dyn FnMut(usize, usize, &str),
+    box_name: &str,
 ) -> bool {
     let id = ui
         .id()
@@ -218,6 +223,13 @@ fn handle_audio_box_interaction(
         };
         on_selection_change(Some(selection));
         *clicked_on_item_in_track = true;
+        interaction_occurred = true;
+    }
+    
+    // Check for double click
+    if region_response.double_clicked() {
+        // Call the double click handler
+        on_box_double_click(track_id, box_id, box_name);
         interaction_occurred = true;
     }
 

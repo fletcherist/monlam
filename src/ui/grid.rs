@@ -36,6 +36,7 @@ pub struct Grid<'a> {
     pub on_toggle_loop: &'a mut dyn FnMut(), // Callback to toggle loop mode
     pub zoom_level: f32,                     // Zoom level for the grid view (1.0 = 100%)
     pub on_zoom_change: &'a mut dyn FnMut(f32),
+    pub on_box_double_click: &'a mut dyn FnMut(usize, usize, &str), // Callback when an AudioBox is double-clicked (track_id, box_id, box_name)
 }
 
 /// Trait for handling grid selection operations
@@ -756,6 +757,7 @@ impl<'a> Grid<'a> {
                             &snap_to_grid,
                             &mut self.on_selection_change,
                             &mut self.on_track_drag,
+                            &mut self.on_box_double_click,
                         );
                     }
                 }

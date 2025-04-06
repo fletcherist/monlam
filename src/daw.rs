@@ -55,6 +55,9 @@ pub enum DawAction {
     DeleteAudioBox(String),    // Delete an AudioBox by name
     AddBoxToTrack(usize, String), // Add an AudioBox to a track (track_id, box_name)
     RenderBoxFromSelection(String), // Render the current selection to an AudioBox
+    OpenBoxInNewTab(String),   // Open an AudioBox in a new tab (box_name)
+    SwitchToTab(usize),        // Switch to a different tab by ID
+    CloseTab(usize),           // Close a tab by ID
 }
 
 const BUFFER_SIZE: usize = 1024;
@@ -612,6 +615,26 @@ impl Track {
     }
 }
 
+/// Represents a tab in the DAW UI
+#[derive(Serialize, Deserialize, Clone)]
+pub struct Tab {
+    pub id: usize,
+    pub name: String,
+    pub is_audio_box: bool,
+    pub audio_box_name: Option<String>,
+}
+
+impl Default for Tab {
+    fn default() -> Self {
+        Self {
+            id: 0,
+            name: "Main".to_string(),
+            is_audio_box: false,
+            audio_box_name: None,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct DawState {
     pub timeline_position: f32,
@@ -636,6 +659,10 @@ pub struct DawState {
     pub zoom_level: f32, // Zoom level for the grid view
     #[serde(default = "default_loop_range")]
     pub loop_range: Option<(f32, f32)>, // Loop start and end times in seconds (None if no range set)
+    #[serde(default = "default_tabs")]
+    pub tabs: Vec<Tab>, // List of open tabs
+    #[serde(default)]
+    pub active_tab_id: usize, // Currently active tab ID
 }
 
 fn default_zoom_level() -> f32 {
@@ -644,6 +671,10 @@ fn default_zoom_level() -> f32 {
 
 fn default_loop_range() -> Option<(f32, f32)> {
     None // Default is no loop range
+}
+
+fn default_tabs() -> Vec<Tab> {
+    vec![Tab::default()]
 }
 
 impl Default for DawState {
@@ -673,6 +704,8 @@ impl Default for DawState {
             loop_enabled: false,
             zoom_level: 1.0,
             loop_range: None,
+            tabs: default_tabs(),
+            active_tab_id: 0,
         }
     }
 }
@@ -1682,6 +1715,68 @@ impl DawApp {
                     eprintln!("Cannot render: No selection active");
                 }
             }
+            DawAction::OpenBoxInNewTab(box_name) => {
+                // Implementation of opening an AudioBox in a new tab
+                if let Some(project_path) = self.state.file_path.as_ref() {
+                    if let Some(project_dir) = project_path.parent() {
+                        let box_path = project_dir.join(&box_name);
+                        if box_path.exists() && box_path.is_dir() {
+                            // Load the box's audio data
+                            let render_path = box_path.join("render.wav");
+                            
+                            if render_path.exists() {
+                                // Create a new tab for this audio box
+                                let tab_id = if self.state.tabs.is_empty() {
+                                    0
+                                } else {
+                                    self.state.tabs.iter().map(|t| t.id).max().unwrap_or(0) + 1
+                                };
+                                
+                                // Create a new tab
+                                let tab = Tab {
+                                    id: tab_id,
+                                    name: format!("Box: {}", box_name),
+                                    is_audio_box: true,
+                                    audio_box_name: Some(box_name.clone()),
+                                };
+                                
+                                // Add the tab to tabs list
+                                self.state.tabs.push(tab);
+                                
+                                // Set this tab as active
+                                self.state.active_tab_id = tab_id;
+                                
+                                // Log that we opened the tab
+                                eprintln!("Opened AudioBox '{}' in new tab", box_name);
+                            } else {
+                                eprintln!("AudioBox '{}' has no render file", box_name);
+                            }
+                        } else {
+                            eprintln!("AudioBox not found: {}", box_name);
+                        }
+                    }
+                } else {
+                    eprintln!("No project path available to locate AudioBox");
+                }
+            }
+            DawAction::SwitchToTab(tab_id) => {
+                // Implementation of switching to a different tab
+                if let Some(tab) = self.state.tabs.iter().find(|t| t.id == tab_id) {
+                    self.state.active_tab_id = tab_id;
+                    eprintln!("Switched to tab: {}", tab.name);
+                } else {
+                    eprintln!("Tab not found: {}", tab_id);
+                }
+            }
+            DawAction::CloseTab(tab_id) => {
+                // Implementation of closing a tab
+                if let Some(tab_index) = self.state.tabs.iter().position(|t| t.id == tab_id) {
+                    self.state.tabs.remove(tab_index);
+                    eprintln!("Closed tab: {}", tab_id);
+                } else {
+                    eprintln!("Tab not found: {}", tab_id);
+                }
+            }
         }
     }
 
@@ -1831,6 +1926,8 @@ impl DawApp {
                 loop_enabled: false,
                 zoom_level: 1.0,
                 loop_range: None,
+                tabs: default_tabs(),
+                active_tab_id: 0,
             },
             audio: Audio::new(),
             last_update: std::time::Instant::now(),
@@ -1987,7 +2084,7 @@ impl DawApp {
             // Then save the project state to project.json file in the project folder
             if let Ok(serialized) = serde_json::to_string_pretty(&self.state) {
                 if fs::write(&project_file_path, serialized).is_ok() {
-                    // Update the file_path in the state and save config
+                    // Update the file_path in the state
                     self.state.file_path = Some(project_file_path.clone());
                     
                     // Save updated state with new file path

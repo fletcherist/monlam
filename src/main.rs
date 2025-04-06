@@ -13,7 +13,7 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
     eframe::run_native(
-        "Monlam DAW",
+        "Monlam",
         options,
         Box::new(|cc| Box::new(DawApp::new(cc))),
     )
