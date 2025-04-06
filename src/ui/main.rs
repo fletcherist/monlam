@@ -584,7 +584,73 @@ impl eframe::App for DawApp {
             .draw(ui);
         });
 
-        // Complete the UI with the central grid and track panels
+        // Create a file browser panel structure with the project directory
+        let mut file_browser = if let Some(stored_browser) = ctx.memory(|mem| mem.data.get_temp::<FileBrowserPanel>(egui::Id::new("file_browser"))) {
+            stored_browser
+        } else {
+            // Get the current project folder from the state.file_path
+            let project_folder = self.state.file_path.as_ref()
+                .and_then(|path| path.parent())
+                .map(|path| path.to_path_buf());
+            
+            FileBrowserPanel::new(project_folder.as_deref())
+        };
+        
+        // Get current side panel width from memory or use default
+        let side_panel_width = ctx.memory(|mem| 
+            mem.data.get_temp::<f32>(egui::Id::new("side_panel_width"))
+                .unwrap_or(200.0)
+        );
+        
+        // Draw file browser panel with resizable width - BEFORE central panel
+        let mut panel_shown = file_browser.get_show_panel();
+        let mut new_panel_width = side_panel_width;
+        egui::SidePanel::left("file_browser_panel")
+            .default_width(side_panel_width)
+            .resizable(true)
+            .show_animated(ctx, panel_shown, |ui| {
+                // Store the current width for synchronization
+                new_panel_width = ui.available_width() + 2.0; // Add some padding
+                
+                ui.horizontal(|ui| {
+                    ui.heading("Project Files");
+                    ui.add_space(ui.available_width() - 100.0);
+                    if ui.button("⟳").clicked() {
+                        // If the project path has changed, update the file browser
+                        let project_folder = self.state.file_path.as_ref()
+                            .and_then(|path| path.parent())
+                            .map(|path| path.to_path_buf());
+                        
+                        if let Some(project_path) = project_folder.as_deref() {
+                            if !file_browser.is_current_folder(project_path) {
+                                file_browser = FileBrowserPanel::new(Some(project_path));
+                            } else {
+                                file_browser.refresh();
+                            }
+                        } else {
+                            file_browser.refresh();
+                        }
+                    }
+                    if ui.button("⬆").clicked() {
+                        file_browser.navigate_up();
+                    }
+                });
+                file_browser.draw(ui, ctx);
+            });
+            
+        // Store the panel width for next frame if it changed
+        if panel_shown && (new_panel_width - side_panel_width).abs() > 1.0 {
+            ctx.memory_mut(|mem| {
+                mem.data.insert_temp(egui::Id::new("side_panel_width"), new_panel_width);
+            });
+        }
+        
+        // Store the updated file browser
+        ctx.memory_mut(|mem| {
+            mem.data.insert_temp(egui::Id::new("file_browser"), file_browser);
+        });
+
+        // Complete the UI with the central grid and track panels AFTER side panel
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.vertical(|ui| {
                 // Add zoom level display and control first
@@ -744,53 +810,6 @@ impl eframe::App for DawApp {
                 }
                 .draw(ui);
             });
-        });
-
-        // Create a file browser panel structure with the project directory
-        let mut file_browser = if let Some(stored_browser) = ctx.memory(|mem| mem.data.get_temp::<FileBrowserPanel>(egui::Id::new("file_browser"))) {
-            stored_browser
-        } else {
-            // Get the current project folder from the state.file_path
-            let project_folder = self.state.file_path.as_ref()
-                .and_then(|path| path.parent())
-                .map(|path| path.to_path_buf());
-            
-            FileBrowserPanel::new(project_folder.as_deref())
-        };
-        
-        // Draw file browser panel
-        egui::SidePanel::left("file_browser_panel")
-            .default_width(200.0)
-            .show_animated(ctx, file_browser.get_show_panel(), |ui| {
-                ui.horizontal(|ui| {
-                    ui.heading("Project Files");
-                    ui.add_space(ui.available_width() - 100.0);
-                    if ui.button("⟳").clicked() {
-                        // If the project path has changed, update the file browser
-                        let project_folder = self.state.file_path.as_ref()
-                            .and_then(|path| path.parent())
-                            .map(|path| path.to_path_buf());
-                        
-                        if let Some(project_path) = project_folder.as_deref() {
-                            if !file_browser.is_current_folder(project_path) {
-                                file_browser = FileBrowserPanel::new(Some(project_path));
-                            } else {
-                                file_browser.refresh();
-                            }
-                        } else {
-                            file_browser.refresh();
-                        }
-                    }
-                    if ui.button("⬆").clicked() {
-                        file_browser.navigate_up();
-                    }
-                });
-                file_browser.draw(ui, ctx);
-            });
-        
-        // Store the updated file browser
-        ctx.memory_mut(|mem| {
-            mem.data.insert_temp(egui::Id::new("file_browser"), file_browser);
         });
 
         // Process the collected actions
