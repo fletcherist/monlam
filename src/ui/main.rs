@@ -1,6 +1,8 @@
-use crate::daw::{DawAction, DawApp, SelectionRect};
+use crate::daw::{DawAction, DawApp, SelectionRect, TrackItemType};
 use crate::ui::grid::Grid;
 use crate::ui::file_browser::FileBrowserPanel;
+use crate::ui::audio_box_panel::AudioBoxPanel;
+use crate::audio_box::AudioBox;
 use crate::ui::drag_drop;
 use eframe::egui;
 use egui::{Color32, Key, RichText, Stroke};
@@ -20,6 +22,7 @@ pub const TRACK_BORDER_COLOR: Color32 = Color32::from_rgb(60, 60, 60);
 pub const TRACK_TEXT_COLOR: Color32 = Color32::from_rgb(200, 200, 200);
 pub const WAVEFORM_COLOR: Color32 = Color32::from_rgb(100, 100, 100);
 pub const SAMPLE_BORDER_COLOR: Color32 = Color32::from_rgb(60, 60, 60);
+pub const AUDIO_BOX_COLOR: Color32 = Color32::from_rgb(100, 120, 180); // Distinct blue color for AudioBox samples
 pub const SCROLLBAR_SIZE: f32 = 14.0;
 pub const BASE_PIXELS_PER_BEAT: f32 = 50.0; // Base pixels per beat at zoom level 1.0
 
@@ -431,6 +434,7 @@ impl eframe::App for DawApp {
                             full_duration,
                             audio_start_time,
                             audio_end_time,
+                            sample.item_type,
                         )
                     })
                     .collect();
@@ -535,6 +539,11 @@ impl eframe::App for DawApp {
             ToggleLoopSelection,
             SetLoopRangeFromSelection,
             SetZoomLevel(f32),
+            CreateAudioBox(String),
+            RenameAudioBox(String, String),
+            DeleteAudioBox(String),
+            AddBoxToTrack(usize, String),
+            RenderBoxFromSelection(String),
         }
 
         // Collect actions during UI rendering using Rc<RefCell>
@@ -624,6 +633,14 @@ impl eframe::App for DawApp {
                         if let Some(project_path) = project_folder.as_deref() {
                             if !file_browser.is_current_folder(project_path) {
                                 file_browser = FileBrowserPanel::new(Some(project_path));
+                                
+                                // Also update the AudioBox panel
+                                let project_path_ref = project_path.clone();
+                                ctx.memory_mut(|mem| {
+                                    // Update the AudioBox panel with the new project path
+                                    let new_box_panel = AudioBoxPanel::new(Some(&project_path_ref));
+                                    mem.data.insert_temp(egui::Id::new("audio_box_panel"), new_box_panel);
+                                });
                             } else {
                                 file_browser.refresh();
                             }
@@ -648,6 +665,84 @@ impl eframe::App for DawApp {
         // Store the updated file browser
         ctx.memory_mut(|mem| {
             mem.data.insert_temp(egui::Id::new("file_browser"), file_browser);
+        });
+        
+        // Create an AudioBox panel structure with the project directory
+        let mut audio_box_panel = if let Some(stored_panel) = ctx.memory(|mem| mem.data.get_temp::<AudioBoxPanel>(egui::Id::new("audio_box_panel"))) {
+            stored_panel
+        } else {
+            // Get the current project folder from the state.file_path
+            let project_folder = self.state.file_path.as_ref()
+                .and_then(|path| path.parent())
+                .map(|path| path.to_path_buf());
+            
+            AudioBoxPanel::new(project_folder.as_deref())
+        };
+        
+        // Draw AudioBox panel with the same width as file browser panel
+        let mut box_panel_shown = panel_shown; // Use the same visibility as file browser
+        egui::SidePanel::left("audio_box_panel")
+            .default_width(new_panel_width)
+            .resizable(false)
+            .show_animated(ctx, box_panel_shown, |ui| {
+                let actions_clone = actions.clone();
+                
+                // Add a button to create a new Box from selection
+                if ui.button("Create Box from Selection").clicked() {
+                    // Check if there's a selection
+                    if self.state.selection.is_some() {
+                        // Show a simple dialog to get the Box name using a MessageDialog
+                        let name = rfd::FileDialog::new()
+                            .set_title("Create Box from Selection")
+                            .set_file_name("New Box Name")
+                            .save_file();
+                        
+                        if let Some(path) = name {
+                            if let Some(file_name) = path.file_name() {
+                                let name = file_name.to_string_lossy().to_string();
+                                if !name.trim().is_empty() && !name.contains('/') {
+                                    actions_clone.borrow_mut().push(UiAction::RenderBoxFromSelection(name));
+                                    // We'll refresh the panel when it's next rendered
+                                } else {
+                                    eprintln!("Invalid Box name: must not be empty or contain '/'");
+                                }
+                            }
+                        }
+                    } else {
+                        eprintln!("Cannot create Box: No selection active");
+                    }
+                }
+                
+                // Handle box interactions, returns an option of the box to open if any
+                if let Some(box_to_open) = audio_box_panel.draw(ui, ctx) {
+                    // When a box is opened, we add it as a sample to the first track
+                    // In a real implementation, you'd handle this differently,
+                    // possibly opening a new tab or window
+                    if let Some(first_track) = self.state.tracks.first() {
+                        actions_clone.borrow_mut().push(UiAction::AddBoxToTrack(first_track.id, box_to_open.name));
+                    }
+                }
+                
+                // Handle box dragging - check if a box is being dragged
+                if let Some(dragged_box) = ctx.memory(|mem| mem.data.get_temp::<AudioBox>(egui::Id::new("dragged_box"))) {
+                    // If we detect a drop on the grid area
+                    for (track_idx, track) in self.state.tracks.iter().enumerate() {
+                        let track_rect = egui::Rect::from_min_size(
+                            egui::pos2(0.0, track_idx as f32 * (TRACK_HEIGHT + TRACK_SPACING)),
+                            egui::vec2(ui.available_width(), TRACK_HEIGHT),
+                        );
+                        
+                        if ui.rect_contains_pointer(track_rect) && ctx.input(|i| i.pointer.any_released()) {
+                            actions_clone.borrow_mut().push(UiAction::AddBoxToTrack(track.id, dragged_box.name));
+                            break;
+                        }
+                    }
+                }
+            });
+        
+        // Store the updated audio box panel
+        ctx.memory_mut(|mem| {
+            mem.data.insert_temp(egui::Id::new("audio_box_panel"), audio_box_panel);
         });
 
         // Complete the UI with the central grid and track panels AFTER side panel
@@ -960,6 +1055,21 @@ impl eframe::App for DawApp {
                     sample_id,
                 } => {
                     self.dispatch(DawAction::DeleteSample(*track_id, *sample_id));
+                }
+                UiAction::CreateAudioBox(name) => {
+                    self.dispatch(DawAction::CreateAudioBox(name.clone()));
+                }
+                UiAction::RenameAudioBox(old_name, new_name) => {
+                    self.dispatch(DawAction::RenameAudioBox(old_name.clone(), new_name.clone()));
+                }
+                UiAction::DeleteAudioBox(name) => {
+                    self.dispatch(DawAction::DeleteAudioBox(name.clone()));
+                }
+                UiAction::AddBoxToTrack(track_id, name) => {
+                    self.dispatch(DawAction::AddBoxToTrack(*track_id, name.clone()));
+                }
+                UiAction::RenderBoxFromSelection(name) => {
+                    self.dispatch(DawAction::RenderBoxFromSelection(name.clone()));
                 }
             }
         }

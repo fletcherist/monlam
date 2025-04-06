@@ -1,4 +1,5 @@
 use crate::audio::{load_audio, Audio};
+use crate::audio_box::AudioBox;
 use crate::config::{load_waveform_data, save_waveform_data, WaveformData};
 use cpal::traits::StreamTrait;
 use rfd::FileDialog;
@@ -48,7 +49,12 @@ pub enum DawAction {
     RenderSelection(PathBuf),  // Path to save the rendered WAV file
     SetZoomLevel(f32),         // Set the zoom level for the grid
     SetLoopRangeFromSelection, // Set loop range from current selection without toggling loop state
-    SetLoopRange(f32, f32),    // Set loop start and end times in seconds (None if no range set)
+    SetLoopRange(f32, f32),    // Set loop start and end times in seconds
+    CreateAudioBox(String),    // Create a new AudioBox with the given name
+    RenameAudioBox(String, String), // Rename an AudioBox (old_name, new_name)
+    DeleteAudioBox(String),    // Delete an AudioBox by name
+    AddBoxToTrack(usize, String), // Add an AudioBox to a track (track_id, box_name)
+    RenderBoxFromSelection(String), // Render the current selection to an AudioBox
 }
 
 const BUFFER_SIZE: usize = 1024;
@@ -59,6 +65,19 @@ pub struct SampleWaveform {
     pub samples: Vec<f32>,
     pub sample_rate: u32,
     pub duration: f32,
+}
+
+/// Type of item in a track - either a sample or an audio box
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TrackItemType {
+    Sample,
+    AudioBox,
+}
+
+impl Default for TrackItemType {
+    fn default() -> Self {
+        TrackItemType::Sample
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -85,6 +104,8 @@ pub struct Sample {
     pub trim_end: f32,        // End trim position in seconds (0.0 = use full sample length)
     #[serde(skip)]
     total_frames: usize,
+    #[serde(default)]
+    pub item_type: TrackItemType, // Type of track item (Sample or AudioBox)
 }
 
 // Manual clone implementation for Sample to handle non-cloneable fields
@@ -108,6 +129,7 @@ impl Clone for Sample {
             trim_start: self.trim_start,
             trim_end: self.trim_end,
             total_frames: self.total_frames,
+            item_type: self.item_type,
         }
     }
 }
@@ -116,22 +138,23 @@ impl Default for Sample {
     fn default() -> Self {
         Self {
             id: 0,
-            name: String::new(),
+            name: "Sample".to_string(),
             audio_file: None,
             waveform_file: None,
             stream: None,
             sample_index: Arc::new(AtomicUsize::new(0)),
-            audio_buffer: Arc::new(Mutex::new(Vec::new())),
+            audio_buffer: Arc::new(Mutex::new(vec![])),
             current_position: 0.0,
             waveform: None,
             is_playing: false,
             grid_position: 0.0,
-            grid_length: 0.0,
+            grid_length: 4.0,
             grid_start_time: 0.0,
             grid_end_time: 0.0,
             trim_start: 0.0,
             trim_end: 0.0,
             total_frames: 0,
+            item_type: TrackItemType::Sample,
         }
     }
 }
@@ -1126,6 +1149,7 @@ impl DawApp {
                         .and_then(|n| n.to_str())
                         .unwrap_or("Unknown")
                         .to_string();
+                    sample.item_type = TrackItemType::Sample; // Mark this sample as a sample
 
                     // Try to load the audio file first
                     if let Some(path_ref) = &sample.audio_file {
@@ -1435,6 +1459,227 @@ impl DawApp {
                     self.state.loop_range = Some((start, end));
                     // Enable looping if we're setting a loop range
                     self.state.loop_enabled = true;
+                }
+            }
+            DawAction::CreateAudioBox(name) => {
+                // Implementation of creating a new AudioBox
+                if let Some(project_path) = self.state.file_path.as_ref() {
+                    if let Some(project_dir) = project_path.parent() {
+                        match AudioBox::new(&name, project_dir) {
+                            Ok(audio_box) => {
+                                eprintln!("Created new AudioBox: {}", name);
+                            }
+                            Err(e) => {
+                                eprintln!("Failed to create AudioBox: {}", e);
+                            }
+                        }
+                    } else {
+                        eprintln!("Cannot determine project directory");
+                    }
+                } else {
+                    eprintln!("No project file path set, cannot create AudioBox");
+                }
+            }
+            DawAction::RenameAudioBox(old_name, new_name) => {
+                // Implementation of renaming an AudioBox
+                if let Some(project_path) = self.state.file_path.as_ref() {
+                    if let Some(project_dir) = project_path.parent() {
+                        let box_path = project_dir.join(&old_name);
+                        if box_path.exists() && box_path.is_dir() {
+                            if let Ok(mut audio_box) = AudioBox::load(&box_path) {
+                                if let Err(e) = audio_box.rename(&new_name, project_dir) {
+                                    eprintln!("Failed to rename AudioBox: {}", e);
+                                } else {
+                                    eprintln!("Renamed AudioBox from {} to {}", old_name, new_name);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            DawAction::DeleteAudioBox(name) => {
+                // Implementation of deleting an AudioBox
+                if let Some(project_path) = self.state.file_path.as_ref() {
+                    if let Some(project_dir) = project_path.parent() {
+                        let box_path = project_dir.join(&name);
+                        if box_path.exists() && box_path.is_dir() {
+                            if let Err(e) = std::fs::remove_dir_all(&box_path) {
+                                eprintln!("Failed to delete AudioBox: {}", e);
+                            } else {
+                                eprintln!("Deleted AudioBox: {}", name);
+                            }
+                        }
+                    }
+                }
+            }
+            DawAction::AddBoxToTrack(track_id, box_name) => {
+                // Implementation of adding an AudioBox to a track
+                if let Some(project_path) = self.state.file_path.as_ref() {
+                    if let Some(project_dir) = project_path.parent() {
+                        let box_path = project_dir.join(&box_name);
+                        if box_path.exists() && box_path.is_dir() {
+                            let render_path = box_path.join("render.wav");
+                            if render_path.exists() {
+                                // Add the AudioBox's rendered audio as a sample to the track
+                                if let Some(track) = self.state.tracks.iter_mut().find(|t| t.id == track_id) {
+                                    let mut sample = Sample::default();
+                                    sample.audio_file = Some(render_path.clone());
+                                    sample.name = box_name.clone();
+                                    sample.item_type = TrackItemType::AudioBox; // Mark this sample as an AudioBox
+
+                                    // Try to load the audio file first
+                                    if let Some(path) = &sample.audio_file {
+                                        match load_audio(path) {
+                                            Ok((samples, sample_rate)) => {
+                                                // Calculate duration
+                                                let duration = samples.len() as f32 / sample_rate as f32;
+                                                
+                                                // Initialize AudioBuffer
+                                                let buffer = Arc::new(Mutex::new(samples));
+                                                sample.audio_buffer = buffer;
+                                                
+                                                // Initialize sample index
+                                                sample.sample_index = Arc::new(AtomicUsize::new(0));
+                                                
+                                                // Calculate grid length based on duration
+                                                sample.grid_length = duration * (self.state.bpm / 60.0);
+                                                sample.update_grid_times(self.state.bpm);
+                                                
+                                                // Get a unique ID
+                                                sample.id = track.samples.len(); // Use length as new ID
+                                                
+                                                // Set the cursor position to the timeline position
+                                                sample.grid_position = self.state.last_clicked_bar;
+                                                sample.update_grid_times(self.state.bpm);
+                                                
+                                                // Create audio stream
+                                                sample.create_stream(&self.audio);
+                                                
+                                                // Generate downsampled waveform for display
+                                                {
+                                                    let buffer_guard = sample.audio_buffer.lock().unwrap();
+                                                    
+                                                    // Generate a smaller waveform for display
+                                                    sample.waveform = Some(SampleWaveform {
+                                                        samples: generate_waveform(&buffer_guard, 1000),
+                                                        sample_rate,
+                                                        duration,
+                                                    });
+                                                } // buffer_guard is dropped here
+                                                
+                                                // Add sample to track
+                                                track.samples.push(sample);
+                                                eprintln!("Added AudioBox {} to track {}", box_name, track_id);
+                                            }
+                                            Err(e) => {
+                                                eprintln!("Error loading audio: {:?}", e);
+                                            }
+                                        }
+                                    }
+                                }
+                            } else {
+                                eprintln!("AudioBox does not have a rendered audio file");
+                            }
+                        } else {
+                            eprintln!("AudioBox not found: {}", box_name);
+                        }
+                    }
+                }
+            }
+            DawAction::RenderBoxFromSelection(box_name) => {
+                // Implementation of rendering the current selection to an AudioBox
+                if let Some(selection) = &self.state.selection {
+                    if let Some(project_path) = self.state.file_path.as_ref() {
+                        if let Some(project_dir) = project_path.parent() {
+                            // Create the AudioBox
+                            match AudioBox::new(&box_name, project_dir) {
+                                Ok(mut audio_box) => {
+                                    // Get the selection data
+                                    let start_track_idx = selection.start_track_idx;
+                                    let end_track_idx = selection.end_track_idx;
+                                    let start_beat = selection.start_beat;
+                                    let end_beat = selection.end_beat;
+                                    
+                                    // Convert beats to time
+                                    let start_time = start_beat * (60.0 / self.state.bpm);
+                                    let end_time = end_beat * (60.0 / self.state.bpm);
+                                    
+                                    // Calculate the duration in seconds
+                                    let duration = end_time - start_time;
+                                    if duration <= 0.0 {
+                                        eprintln!("Cannot render with zero or negative duration");
+                                        return;
+                                    }
+                                    
+                                    // Create a buffer for the mixed audio
+                                    let sample_rate = 44100; // Standard sample rate
+                                    let num_samples = (duration * sample_rate as f32) as usize;
+                                    let mut mixed_buffer = vec![0.0; num_samples];
+                                    
+                                    // For simplicity, we'll mix down all tracks to mono
+                                    for track_idx in start_track_idx..=end_track_idx {
+                                        if let Some(track) = self.state.tracks.get(track_idx) {
+                                            for sample in &track.samples {
+                                                // Skip if sample is outside the selection
+                                                if sample.grid_end_time <= start_time || sample.grid_start_time >= end_time {
+                                                    continue;
+                                                }
+                                                
+                                                // Get the audio data
+                                                if let Ok(audio_data) = sample.audio_buffer.lock() {
+                                                    // Calculate the relative position in the mixed buffer
+                                                    let sample_offset = ((sample.grid_start_time - start_time) * sample_rate as f32).max(0.0) as usize;
+                                                    
+                                                    // Calculate how many samples to mix
+                                                    let available_samples = audio_data.len();
+                                                    let start_sample = ((sample.trim_start * sample_rate as f32).max(0.0)) as usize;
+                                                    let end_sample = if sample.trim_end > 0.0 {
+                                                        ((sample.trim_end * sample_rate as f32).min(available_samples as f32)) as usize
+                                                    } else {
+                                                        available_samples
+                                                    };
+                                                    
+                                                    // Get the samples to mix
+                                                    for (i, sample_idx) in (start_sample..end_sample).enumerate() {
+                                                        let target_idx = sample_offset + i;
+                                                        if target_idx < mixed_buffer.len() && sample_idx < available_samples {
+                                                            // For now, simply add the samples (basic mixing)
+                                                            mixed_buffer[target_idx] += audio_data[sample_idx];
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    
+                                    // Normalize the mixed buffer
+                                    let mut max_amplitude = 0.0f32;
+                                    for sample in &mixed_buffer {
+                                        max_amplitude = max_amplitude.max(sample.abs());
+                                    }
+                                    
+                                    if max_amplitude > 0.0 {
+                                        let normalize_factor = 0.9 / max_amplitude; // Leave some headroom
+                                        for sample in &mut mixed_buffer {
+                                            *sample *= normalize_factor;
+                                        }
+                                    }
+                                    
+                                    // Render the mixed buffer to the AudioBox
+                                    if let Err(e) = audio_box.render(&mixed_buffer, sample_rate) {
+                                        eprintln!("Failed to render AudioBox: {}", e);
+                                    } else {
+                                        eprintln!("Successfully rendered selection to AudioBox: {}", box_name);
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("Failed to create AudioBox: {}", e);
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    eprintln!("Cannot render: No selection active");
                 }
             }
         }
@@ -1765,4 +2010,35 @@ impl DawApp {
 #[derive(Serialize, Deserialize, Clone)]
 struct Config {
     latest_project: Option<PathBuf>,
+}
+
+// Helper function to create a downsampled waveform for visualization
+fn generate_waveform(samples: &[f32], target_size: usize) -> Vec<f32> {
+    if samples.is_empty() {
+        return Vec::new();
+    }
+    
+    let samples_per_point = (samples.len() as f32 / target_size as f32).max(1.0) as usize;
+    let mut waveform = Vec::with_capacity(target_size);
+    
+    for i in 0..target_size {
+        let start = (i * samples_per_point).min(samples.len());
+        let end = ((i + 1) * samples_per_point).min(samples.len());
+        
+        if start < end {
+            // Find the maximum amplitude in this segment
+            let mut max_amplitude = 0.0f32;
+            for j in start..end {
+                let amplitude = samples[j].abs();
+                if amplitude > max_amplitude {
+                    max_amplitude = amplitude;
+                }
+            }
+            waveform.push(max_amplitude);
+        } else {
+            break;
+        }
+    }
+    
+    waveform
 }

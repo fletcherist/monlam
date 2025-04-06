@@ -252,4 +252,16 @@ pub fn is_drag_active(ctx: &egui::Context) -> bool {
     }
     
     internal_drag || external_drag
+}
+
+/// Check if a position is over a track in the grid area
+pub fn is_position_over_track(ui: &egui::Ui, track_idx: usize, track_height: f32, track_spacing: f32) -> bool {
+    let track_top = track_idx as f32 * (track_height + track_spacing);
+    let track_bottom = track_top + track_height;
+    
+    if let Some(pos) = ui.ctx().pointer_interact_pos() {
+        pos.y >= track_top && pos.y <= track_bottom
+    } else {
+        false
+    }
 } 

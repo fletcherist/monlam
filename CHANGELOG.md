@@ -19,7 +19,8 @@
 [x] - cmd + s for saving project
 [x] - show files in a current project folder
 [x] - drag audio files directly to the grid
-[] - side panel should be in sync by width with the grid
+[x] - side panel should be in sync by width with the grid
+
 
 [] - store waveforms not in .monlam folder but in project folder in .monlam folder
 [] - investigate why .mp3 files loading took so long
@@ -27,6 +28,5 @@
 
 
 
-
-
 4. timeline is a place where i can add markers via right click -> add marker
+
