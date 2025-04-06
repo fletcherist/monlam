@@ -16,6 +16,10 @@
 
 
 
+[x] - cmd + s for saving project
+[] - show files in a current project folder
+[] - store waveforms not in .monlam folder but in project folder in .monlam folder
+
 
 [] - fix: zoom is implemented via alt, replace with cmd
 

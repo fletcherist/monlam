@@ -126,7 +126,7 @@ impl<'a> TransportControls<'a> {
             // Save and Load buttons
             if ui
                 .button(RichText::new("💾").size(20.0))
-                .on_hover_text("Save Project")
+                .on_hover_text("Save Project (⌘S) • Save As (⌘⇧S)")
                 .clicked()
             {
                 (self.on_save)();
@@ -314,6 +314,16 @@ impl eframe::App for DawApp {
             self.dispatch(DawAction::TogglePlayback);
         }
 
+        // Handle Cmd+S to save project
+        if ctx.input(|i| i.key_pressed(Key::S) && i.modifiers.command && !i.modifiers.shift) {
+            self.save_project();
+        }
+
+        // Handle Cmd+Shift+S for Save As
+        if ctx.input(|i| i.key_pressed(Key::S) && i.modifiers.command && i.modifiers.shift) {
+            self.save_project_as();
+        }
+
         // Handle Cmd+L to toggle loop with current selection
         if ctx.input(|i| i.key_pressed(Key::L) && i.modifiers.command) {
             // Only enable looping if there's a selection
@@ -459,6 +469,7 @@ impl eframe::App for DawApp {
             SetBpm(f32),
             SetGridDivision(f32),
             SaveProject,
+            SaveProjectAs,
             LoadProject,
             RenderSelection,
             SetTimelinePosition(f32),
@@ -736,6 +747,9 @@ impl eframe::App for DawApp {
                 }
                 UiAction::SaveProject => {
                     self.save_project();
+                }
+                UiAction::SaveProjectAs => {
+                    self.save_project_as();
                 }
                 UiAction::LoadProject => {
                     self.load_project();
