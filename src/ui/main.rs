@@ -23,6 +23,9 @@ pub const GROUP_COLOR: Color32 = Color32::from_rgb(100, 120, 180); // Distinct b
 pub const SELECTION_COLOR: Color32 = Color32::from_rgb(50, 100, 255); // Blue color for selected bars/elements
 pub const SCROLLBAR_SIZE: f32 = 14.0;
 pub const BASE_PIXELS_PER_BEAT: f32 = 50.0; // Base pixels per beat at zoom level 1.0
+// Define scroll sensitivity constant
+pub const SCROLL_SENSITIVITY: f32 = 2.0; // Higher value = more sensitive scrolling/zooming
+pub const ZOOM_SENSITIVITY_FACTOR: f32 = 0.002; // Multiplier to adjust zoom relative to scroll
 
 // UI Components
 struct TransportControls<'a> {

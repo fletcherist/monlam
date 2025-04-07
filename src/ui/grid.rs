@@ -1,8 +1,8 @@
 use crate::daw::SelectionRect;
 use crate::ui::main::{
     BAR_LINE_COLOR, BASE_PIXELS_PER_BEAT, BEAT_LINE_COLOR, GRID_BACKGROUND, PLAYHEAD_COLOR,
-    SAMPLE_BORDER_COLOR, SCROLLBAR_SIZE, SELECTION_COLOR, TRACK_BORDER_COLOR, TRACK_HEIGHT,
-    TRACK_SPACING, TRACK_TEXT_COLOR, WAVEFORM_COLOR,
+    SCROLLBAR_SIZE, SELECTION_COLOR, TRACK_BORDER_COLOR, TRACK_HEIGHT,
+    TRACK_SPACING, TRACK_TEXT_COLOR, SCROLL_SENSITIVITY, ZOOM_SENSITIVITY_FACTOR,
 };
 use crate::ui::grid_item::{GridItem, GridItemDragging, GridItemHelper};
 use crate::daw::TrackItemType;
@@ -1161,7 +1161,7 @@ impl<'a> Grid<'a> {
             let scroll_delta = ui.input(|i| i.smooth_scroll_delta);
             // Vertical scrolling with mouse wheel
             if scroll_delta.y != 0.0 {
-                v_scroll_offset += scroll_delta.y * -0.5; // Adjust sensitivity
+                v_scroll_offset += scroll_delta.y * -SCROLL_SENSITIVITY; // Use constant
                 v_scroll_offset = v_scroll_offset
                     .max(0.0)
                     .min((min_grid_height - visible_height).max(0.0));
@@ -1174,7 +1174,7 @@ impl<'a> Grid<'a> {
                 } else {
                     scroll_delta.y
                 };
-                let time_delta = h_delta * -0.1 * seconds_per_pixel; // Adjust sensitivity
+                let time_delta = h_delta * -SCROLL_SENSITIVITY * 0.2 * seconds_per_pixel; // Use constant with adjustment factor
                 h_scroll_offset += time_delta;
                 h_scroll_offset = h_scroll_offset
                     .max(0.0)
@@ -1401,10 +1401,11 @@ impl<'a> GridZooming for Grid<'a> {
         let scroll_input = ui.input(|i| i.smooth_scroll_delta);
 
         if scroll_input.y != 0.0 {
-            // Calculate zoom factor based on scroll direction - reduced sensitivity
-            let zoom_delta = if scroll_input.y > 0.0 { 1.05 } else { 0.95 };
+            // Calculate zoom factor based on actual scroll delta with a sensitivity factor
+            // Use shared SCROLL_SENSITIVITY with zoom factor adjustment
+            let zoom_factor = 1.0 + (scroll_input.y * -ZOOM_SENSITIVITY_FACTOR * SCROLL_SENSITIVITY); // Invert so scrolling down zooms out
             let old_zoom = *zoom_level;
-            let new_zoom = (old_zoom * zoom_delta).clamp(0.1, 10.0);
+            let new_zoom = (old_zoom * zoom_factor).clamp(0.1, 10.0);
 
             // Get mouse position for zooming to cursor position
             if let Some(mouse_pos) = ui.input(|i| i.pointer.hover_pos()) {
@@ -1430,11 +1431,6 @@ impl<'a> GridZooming for Grid<'a> {
                         .max(0.0)
                         .min(total_duration - (actual_width * new_seconds_per_pixel));
 
-                    eprintln!(
-                        "Alt+Scroll zooming from {:.2} to {:.2} at time position {:.2}",
-                        old_zoom, new_zoom, time_at_mouse_before
-                    );
-
                     // Report zoom change through callback
                     (on_zoom_change)(new_zoom);
                 } else {
@@ -1446,10 +1442,6 @@ impl<'a> GridZooming for Grid<'a> {
                 // No mouse position, just zoom centered
                 *zoom_level = new_zoom;
                 (on_zoom_change)(new_zoom);
-                eprintln!(
-                    "Alt+Scroll zoom (centered): {:.2} to {:.2}",
-                    old_zoom, new_zoom
-                );
             }
         }
     }
