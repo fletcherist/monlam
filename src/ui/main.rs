@@ -373,6 +373,16 @@ impl eframe::App for DawApp {
             self.save_project_as();
         }
 
+        // Handle Cmd+Shift+[ to switch to previous tab
+        if ctx.input(|i| i.key_pressed(Key::ArrowLeft) && i.modifiers.command && i.modifiers.shift) {
+            self.switch_to_previous_tab();
+        }
+
+        // Handle Cmd+Shift+] to switch to next tab
+        if ctx.input(|i| i.key_pressed(Key::ArrowRight) && i.modifiers.command && i.modifiers.shift) {
+            self.switch_to_next_tab();
+        }
+
         // Handle Cmd+L to toggle loop with current selection
         if ctx.input(|i| i.key_pressed(Key::L) && i.modifiers.command) {
             // Only enable looping if there's a selection
@@ -449,67 +459,64 @@ impl eframe::App for DawApp {
         let track_info: Vec<_>;
         
         if is_audio_box_tab {
-            // Create a temporary track for the audio box
+            // Create temporary tracks for the audio box - use the same number of tracks as default project
             let mut temp_tracks = Vec::new();
             
-            if let Some(box_name) = &audio_box_name {
-                // Load the AudioBox data from disk
-                if let Some(project_path) = self.state.file_path.as_ref() {
-                    if let Some(project_dir) = project_path.parent() {
-                        let box_path = project_dir.join(box_name);
-                        let render_path = box_path.join("render.wav");
-                        
-                        if render_path.exists() {
-                            // Try to load audio file to get waveform data
-                            if let Ok((samples, rate)) = crate::audio::load_audio(&render_path) {
-                                // Generate waveform data
-                                let duration = samples.len() as f32 / rate as f32;
+            // Create 4 default tracks (same as default project)
+            for i in 0..4 {
+                let track_id = i;
+                let track_name = format!("Track {}", i + 1);
+                let mut samples = Vec::new();
+                
+                // Only put the audio box in the first track
+                if i == 0 && audio_box_name.is_some() {
+                    if let Some(box_name) = &audio_box_name {
+                        // Load the AudioBox data from disk
+                        if let Some(project_path) = self.state.file_path.as_ref() {
+                            if let Some(project_dir) = project_path.parent() {
+                                let box_path = project_dir.join(box_name);
+                                let render_path = box_path.join("render.wav");
                                 
-                                // Downsample for waveform
-                                let downsample_factor = samples.len() / 1000;
-                                let waveform_data: Vec<f32> = samples
-                                    .chunks(downsample_factor.max(1))
-                                    .map(|chunk| chunk.iter().map(|&s| s.abs()).fold(0.0, f32::max))
-                                    .collect();
-                                
-                                // Create a sample info entry representing the audio box
-                                let sample_info = (
-                                    0, // sample id
-                                    box_name.clone(),
-                                    0.0, // position
-                                    duration * (bpm / 60.0), // length in beats
-                                    waveform_data,
-                                    rate,
-                                    duration,
-                                    0.0, // audio_start_time
-                                    duration, // audio_end_time
-                                    TrackItemType::AudioBox,
-                                );
-                                
-                                // Add the temporary track with the audio box
-                                temp_tracks.push((
-                                    0, // track id
-                                    format!("Box: {}", box_name),
-                                    false, // muted
-                                    false, // soloed
-                                    false, // recording
-                                    vec![sample_info], // samples
-                                ));
+                                if render_path.exists() {
+                                    // Try to load audio file to get waveform data
+                                    if let Ok((audio_samples, rate)) = crate::audio::load_audio(&render_path) {
+                                        // Generate waveform data
+                                        let duration = audio_samples.len() as f32 / rate as f32;
+                                        
+                                        // Generate waveform for display
+                                        let waveform_data = generate_waveform(&audio_samples, 1000);
+                                        
+                                        // Create a sample info entry representing the audio box
+                                        let sample_info = (
+                                            0, // sample id
+                                            box_name.clone(),
+                                            0.0, // position
+                                            duration * (bpm / 60.0), // length in beats
+                                            waveform_data, 
+                                            rate,
+                                            duration,
+                                            0.0, // trim_start (audio_start_time)
+                                            duration, // audio_end_time
+                                            TrackItemType::AudioBox,
+                                        );
+                                        
+                                        // Add the box to the track's samples
+                                        samples.push(sample_info);
+                                    }
+                                }
                             }
                         }
                     }
                 }
-            }
-            
-            // If we couldn't load the audio box, still provide an empty track
-            if temp_tracks.is_empty() {
+                
+                // Add the track to our list
                 temp_tracks.push((
-                    0,
-                    "Empty Track".to_string(),
-                    false,
-                    false,
-                    false,
-                    Vec::new(),
+                    track_id,
+                    track_name,
+                    false, // muted
+                    false, // soloed
+                    false, // recording
+                    samples, // samples list (may be empty)
                 ));
             }
             
@@ -577,53 +584,56 @@ impl eframe::App for DawApp {
             // For audio box tabs, create matching controls for our temporary tracks
             let mut temp_controls = Vec::new();
             
-            if let Some(box_name) = &audio_box_name {
-                // Get audio data for duration
-                let mut duration = 0.0;
+            // Create 4 default tracks (same as default project)
+            for i in 0..4 {
+                let track_id = i;
+                let track_name = format!("Track {}", i + 1);
+                let mut samples = Vec::new();
                 
-                if let Some(project_path) = self.state.file_path.as_ref() {
-                    if let Some(project_dir) = project_path.parent() {
-                        let box_path = project_dir.join(box_name);
-                        let render_path = box_path.join("render.wav");
+                // Only put the audio box in the first track
+                if i == 0 && audio_box_name.is_some() {
+                    if let Some(box_name) = &audio_box_name {
+                        // Get audio data for duration
+                        let mut duration = 0.0;
                         
-                        if render_path.exists() {
-                            if let Ok((samples, rate)) = crate::audio::load_audio(&render_path) {
-                                duration = samples.len() as f32 / rate as f32;
+                        if let Some(project_path) = self.state.file_path.as_ref() {
+                            if let Some(project_dir) = project_path.parent() {
+                                let box_path = project_dir.join(box_name);
+                                let render_path = box_path.join("render.wav");
+                                
+                                if render_path.exists() {
+                                    if let Ok((audio_samples, rate)) = crate::audio::load_audio(&render_path) {
+                                        duration = audio_samples.len() as f32 / rate as f32;
+                                    }
+                                }
                             }
                         }
+                        
+                        // Create a sample entry for controls
+                        let sample_info = (
+                            0, // sample id
+                            box_name.clone(),
+                            0.0, // position
+                            duration * (bpm / 60.0), // length in beats
+                            0.0, // current position
+                            duration, // duration
+                            0.0, // trim_start
+                            0.0, // trim_end
+                        );
+                        
+                        // Add the sample info
+                        samples.push(sample_info);
                     }
                 }
                 
-                // Create a sample entry
-                let sample_info = (
-                    0, // sample id
-                    box_name.clone(),
-                    0.0, // position
-                    duration * (bpm / 60.0), // length in beats
-                    0.0, // current position
-                    duration, // duration
-                    0.0, // trim_start
-                    0.0, // trim_end
-                );
-                
-                // Add control for the temporary track
+                // Add the track to controls
                 temp_controls.push((
-                    0, // track id
-                    format!("Box: {}", box_name),
+                    track_id,
+                    track_name,
                     false, // muted
                     false, // soloed
                     false, // recording
-                    vec![sample_info], // samples
-                ));
-            } else {
-                // Empty track control if we don't have a box name
-                temp_controls.push((
-                    0,
-                    "Empty Track".to_string(),
-                    false,
-                    false,
-                    false,
-                    Vec::new(),
+                    samples, // samples list (may be empty)
                 ));
             }
             
@@ -728,6 +738,7 @@ impl eframe::App for DawApp {
             OpenBoxInNewTab(String),
             SwitchToTab(usize),
             CloseTab(usize),
+            SaveAudioBox(String),
         }
 
         // Collect actions during UI rendering using Rc<RefCell>
@@ -1109,6 +1120,31 @@ impl eframe::App for DawApp {
                     },
                 }
                 .draw(ui);
+
+                // Add a button to save the audio box when it's open in a tab
+                if is_audio_box_tab {
+                    if let Some(box_name) = &audio_box_name {
+                        ui.horizontal(|ui| {
+                            ui.add_space(8.0);
+                            
+                            ui.label(RichText::new("Audio Box:").size(16.0).strong());
+                            ui.label(RichText::new(box_name).size(16.0));
+                            
+                            ui.add_space(ui.available_width() - 120.0);
+                            
+                            if ui.button(RichText::new("💾 Save Box").size(14.0))
+                                .on_hover_text("Save AudioBox and update render.wav")
+                                .clicked() 
+                            {
+                                actions_clone.borrow_mut().push(UiAction::SaveAudioBox(box_name.clone()));
+                            }
+                        });
+                        
+                        ui.add_space(4.0);
+                        ui.separator();
+                        ui.add_space(4.0);
+                    }
+                }
             });
         });
 
@@ -1202,7 +1238,46 @@ impl eframe::App for DawApp {
                         .add_filter("Audio", &["mp3", "wav", "ogg", "flac"])
                         .pick_file()
                     {
-                        self.dispatch(DawAction::AddSampleToTrack(*track_id, path));
+                        // Get the path where to copy the sample if we're in an AudioBox
+                        let active_tab = self.state.tabs.iter().find(|t| t.id == self.state.active_tab_id);
+                        let is_audio_box_tab = active_tab.map_or(false, |tab| tab.is_audio_box);
+                        
+                        if is_audio_box_tab {
+                            // If we're in an audio box, we first need to copy the file to the samples directory
+                            if let Some(box_name) = active_tab.and_then(|tab| tab.audio_box_name.clone()) {
+                                if let Some(project_path) = self.state.file_path.as_ref() {
+                                    if let Some(project_dir) = project_path.parent() {
+                                        let box_path = project_dir.join(&box_name);
+                                        let samples_dir = box_path.join("samples");
+                                        
+                                        // Create samples directory if it doesn't exist
+                                        if !samples_dir.exists() {
+                                            if let Err(e) = std::fs::create_dir_all(&samples_dir) {
+                                                eprintln!("Failed to create samples directory: {:?}", e);
+                                                return;
+                                            }
+                                        }
+                                        
+                                        // Copy the file to the samples directory
+                                        let file_name = path.file_name().unwrap_or_default();
+                                        let target_path = samples_dir.join(file_name);
+                                        
+                                        if let Err(e) = std::fs::copy(&path, &target_path) {
+                                            eprintln!("Failed to copy file to AudioBox: {:?}", e);
+                                            return;
+                                        }
+                                        
+                                        // Use the copied file path for the sample
+                                        self.dispatch(DawAction::AddSampleToTrack(*track_id, target_path));
+                                        
+                                        eprintln!("Added sample to AudioBox '{}' at track {}", box_name, track_id);
+                                    }
+                                }
+                            }
+                        } else {
+                            // In main project tab, use the normal AddSampleToTrack action with original path
+                            self.dispatch(DawAction::AddSampleToTrack(*track_id, path));
+                        }
                     }
                 }
                 UiAction::ToggleTrackMute(track_id) => {
@@ -1284,6 +1359,9 @@ impl eframe::App for DawApp {
                 }
                 UiAction::CloseTab(tab_id) => {
                     self.dispatch(DawAction::CloseTab(*tab_id));
+                }
+                UiAction::SaveAudioBox(box_name) => {
+                    self.dispatch(DawAction::SaveAudioBox(box_name.clone()));
                 }
             }
         }

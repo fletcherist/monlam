@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 use symphonia::core::audio::AudioBufferRef;
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::probe::Hint;
+use hound::{WavSpec, WavWriter};
 
 // Custom error type for audio loading errors
 #[derive(Debug)]
@@ -150,4 +151,26 @@ pub fn load_audio(path: &Path) -> Result<(Vec<f32>, u32), AudioError> {
     }
 
     Ok((samples, sample_rate))
+}
+
+pub fn save_audio(path: &Path, samples: &[f32], sample_rate: u32) -> Result<(), AudioError> {
+    let spec = WavSpec {
+        channels: 1,  // mono
+        sample_rate,
+        bits_per_sample: 32,
+        sample_format: hound::SampleFormat::Float,
+    };
+
+    let mut writer = WavWriter::create(path, spec)
+        .map_err(|e| AudioError::Io(io::Error::new(io::ErrorKind::Other, e)))?;
+
+    for &sample in samples {
+        writer.write_sample(sample)
+            .map_err(|e| AudioError::Io(io::Error::new(io::ErrorKind::Other, e)))?;
+    }
+
+    writer.finalize()
+        .map_err(|e| AudioError::Io(io::Error::new(io::ErrorKind::Other, e)))?;
+
+    Ok(())
 }

@@ -58,6 +58,7 @@ pub enum DawAction {
     OpenBoxInNewTab(String),   // Open an AudioBox in a new tab (box_name)
     SwitchToTab(usize),        // Switch to a different tab by ID
     CloseTab(usize),           // Close a tab by ID
+    SaveAudioBox(String),      // Save current AudioBox state and update render.wav
 }
 
 const BUFFER_SIZE: usize = 1024;
@@ -1721,36 +1722,115 @@ impl DawApp {
                     if let Some(project_dir) = project_path.parent() {
                         let box_path = project_dir.join(&box_name);
                         if box_path.exists() && box_path.is_dir() {
-                            // Load the box's audio data
-                            let render_path = box_path.join("render.wav");
-                            
-                            if render_path.exists() {
-                                // Create a new tab for this audio box
-                                let tab_id = if self.state.tabs.is_empty() {
-                                    0
-                                } else {
-                                    self.state.tabs.iter().map(|t| t.id).max().unwrap_or(0) + 1
-                                };
-                                
-                                // Create a new tab
-                                let tab = Tab {
-                                    id: tab_id,
-                                    name: format!("Box: {}", box_name),
-                                    is_audio_box: true,
-                                    audio_box_name: Some(box_name.clone()),
-                                };
-                                
-                                // Add the tab to tabs list
-                                self.state.tabs.push(tab);
-                                
-                                // Set this tab as active
-                                self.state.active_tab_id = tab_id;
-                                
-                                // Log that we opened the tab
-                                eprintln!("Opened AudioBox '{}' in new tab", box_name);
+                            // Create a new tab for this audio box
+                            let tab_id = if self.state.tabs.is_empty() {
+                                0
                             } else {
-                                eprintln!("AudioBox '{}' has no render file", box_name);
+                                self.state.tabs.iter().map(|t| t.id).max().unwrap_or(0) + 1
+                            };
+                            
+                            // Create a new tab
+                            let tab = Tab {
+                                id: tab_id,
+                                name: format!("Box: {}", box_name),
+                                is_audio_box: true,
+                                audio_box_name: Some(box_name.clone()),
+                            };
+                            
+                            // Add the tab to tabs list
+                            self.state.tabs.push(tab);
+                            
+                            // Set this tab as active
+                            self.state.active_tab_id = tab_id;
+                            
+                            // Load samples folder from the box path
+                            let samples_dir = box_path.join("samples");
+                            if samples_dir.exists() && samples_dir.is_dir() {
+                                // We'll load any samples in this folder to the first track in the AudioBox
+                                if let Ok(entries) = std::fs::read_dir(&samples_dir) {
+                                    for entry in entries.filter_map(|e| e.ok()) {
+                                        let sample_path = entry.path();
+                                        
+                                        // Check if it's an audio file
+                                        if sample_path.is_file() {
+                                            let extension = sample_path.extension()
+                                                .and_then(|ext| ext.to_str())
+                                                .unwrap_or("")
+                                                .to_lowercase();
+                                                
+                                            if ["wav", "mp3", "ogg", "flac"].contains(&extension.as_str()) {
+                                                // The first track has ID 0 in our AudioBox
+                                                // Load this sample in the box's context
+                                                eprintln!("Loading sample for AudioBox: {:?}", sample_path);
+                                                
+                                                // This will be handled by the UI to add to the correct context
+                                                if let Some(track) = self.state.tracks.iter_mut().find(|t| t.id == 0) {
+                                                    let mut sample = Sample::default();
+                                                    sample.audio_file = Some(sample_path.clone());
+                                                    sample.name = sample_path.file_name()
+                                                        .and_then(|n| n.to_str())
+                                                        .unwrap_or("Unknown")
+                                                        .to_string();
+                                                    
+                                                    // Try to load the audio file
+                                                    if let Some(path) = &sample.audio_file {
+                                                        match load_audio(path) {
+                                                            Ok((samples, sample_rate)) => {
+                                                                // Initialize sample with loaded audio data
+                                                                let duration = samples.len() as f32 / sample_rate as f32;
+                                                                
+                                                                // Initialize AudioBuffer
+                                                                let buffer = Arc::new(Mutex::new(samples));
+                                                                sample.audio_buffer = buffer;
+                                                                
+                                                                // Initialize sample index
+                                                                sample.sample_index = Arc::new(AtomicUsize::new(0));
+                                                                
+                                                                // Calculate grid length based on duration
+                                                                sample.grid_length = duration * (self.state.bpm / 60.0);
+                                                                sample.update_grid_times(self.state.bpm);
+                                                                
+                                                                // Get a unique ID
+                                                                sample.id = track.samples.len(); // Use length as new ID
+                                                                
+                                                                // Set the position to a sensible place
+                                                                sample.grid_position = track.samples.iter()
+                                                                    .map(|s| s.grid_position + s.grid_length)
+                                                                    .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                                                                    .unwrap_or(0.0);
+                                                                sample.update_grid_times(self.state.bpm);
+                                                                
+                                                                // Create audio stream
+                                                                sample.create_stream(&self.audio);
+                                                                
+                                                                // Generate waveform
+                                                                {
+                                                                    let buffer_guard = sample.audio_buffer.lock().unwrap();
+                                                                    
+                                                                    // Generate a smaller waveform for display
+                                                                    sample.waveform = Some(SampleWaveform {
+                                                                        samples: generate_waveform(&buffer_guard, 1000),
+                                                                        sample_rate,
+                                                                        duration,
+                                                                    });
+                                                                }
+                                                                
+                                                                // Add sample to track
+                                                                track.samples.push(sample);
+                                                            }
+                                                            Err(e) => {
+                                                                eprintln!("Error loading audio: {:?}", e);
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                             }
+                            
+                            eprintln!("Opened AudioBox '{}' in new tab", box_name);
                         } else {
                             eprintln!("AudioBox not found: {}", box_name);
                         }
@@ -1775,6 +1855,106 @@ impl DawApp {
                     eprintln!("Closed tab: {}", tab_id);
                 } else {
                     eprintln!("Tab not found: {}", tab_id);
+                }
+            }
+            DawAction::SaveAudioBox(box_name) => {
+                // Implementation of saving an AudioBox state and updating its render.wav
+                if let Some(project_path) = self.state.file_path.as_ref() {
+                    if let Some(project_dir) = project_path.parent() {
+                        let box_path = project_dir.join(&box_name);
+                        
+                        // Ensure the box directory exists
+                        if !box_path.exists() {
+                            if let Err(e) = std::fs::create_dir_all(&box_path) {
+                                eprintln!("Failed to create AudioBox directory: {:?}", e);
+                                return;
+                            }
+                        }
+                        
+                        // Ensure samples directory exists
+                        let samples_dir = box_path.join("samples");
+                        if !samples_dir.exists() {
+                            if let Err(e) = std::fs::create_dir_all(&samples_dir) {
+                                eprintln!("Failed to create samples directory: {:?}", e);
+                                return;
+                            }
+                        }
+                        
+                        // Save project state to the box directory
+                        // TODO: Save full project state to support multi-track audio boxes
+                        
+                        // Render tracks to a single audio file
+                        if let Some(tab) = self.state.tabs.iter().find(|t| 
+                            t.is_audio_box && 
+                            t.audio_box_name.as_ref().map_or(false, |name| name == &box_name)
+                        ) {
+                            // Render all tracks to a single audio file
+                            // We can reuse the render selection logic
+                            let render_path = box_path.join("render.wav");
+                            
+                            // For now, just mix all active samples
+                            let mut final_samples = Vec::new();
+                            let mut final_rate = 44100;
+                            
+                            for track in &self.state.tracks {
+                                if track.muted {
+                                    continue;
+                                }
+                                
+                                for sample in &track.samples {
+                                    if let Some(waveform) = &sample.waveform {
+                                        if let Ok(buffer_guard) = sample.audio_buffer.lock() {
+                                            // Apply trim points
+                                            let start_frame = (sample.trim_start * waveform.sample_rate as f32) as usize;
+                                            let end_frame = if sample.trim_end <= 0.0 {
+                                                buffer_guard.len()
+                                            } else {
+                                                (sample.trim_end * waveform.sample_rate as f32) as usize
+                                            };
+                                            
+                                            // Get trimmed audio
+                                            let trimmed_audio: Vec<f32> = buffer_guard
+                                                .iter()
+                                                .skip(start_frame)
+                                                .take(end_frame.saturating_sub(start_frame))
+                                                .cloned()
+                                                .collect();
+                                            
+                                            // Mix with existing audio
+                                            if final_samples.is_empty() {
+                                                final_samples = trimmed_audio;
+                                                final_rate = waveform.sample_rate;
+                                            } else {
+                                                // Simple mixing - in a real implementation we'd need to handle sample rate conversion
+                                                // and different lengths better
+                                                let max_len = final_samples.len().max(trimmed_audio.len());
+                                                let mut mixed = Vec::with_capacity(max_len);
+                                                
+                                                for i in 0..max_len {
+                                                    let a = if i < final_samples.len() { final_samples[i] } else { 0.0 };
+                                                    let b = if i < trimmed_audio.len() { trimmed_audio[i] } else { 0.0 };
+                                                    
+                                                    // Simple mixing - 0.5 scale to avoid clipping
+                                                    mixed.push((a + b) * 0.5);
+                                                }
+                                                
+                                                final_samples = mixed;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            
+                            // Save the render.wav file
+                            if !final_samples.is_empty() {
+                                if let Err(e) = crate::audio::save_audio(&render_path, &final_samples, final_rate) {
+                                    eprintln!("Failed to save AudioBox render: {:?}", e);
+                                } else {
+                                    eprintln!("Updated AudioBox '{}' render file", box_name);
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -2099,6 +2279,48 @@ impl DawApp {
                 }
             } else {
                 eprintln!("Failed to serialize project state");
+            }
+        }
+    }
+
+    // Add these methods after existing DawApp implementation methods but before any other impl blocks
+
+    // Switch to the previous tab in the tabs list
+    pub fn switch_to_previous_tab(&mut self) {
+        if self.state.tabs.is_empty() {
+            return;
+        }
+        
+        // Find current tab index
+        let current_index = self.state.tabs.iter().position(|t| t.id == self.state.active_tab_id);
+        
+        if let Some(idx) = current_index {
+            // Calculate previous index (wrap around to the end)
+            let prev_idx = if idx == 0 { self.state.tabs.len() - 1 } else { idx - 1 };
+            
+            // Switch to the previous tab
+            if let Some(tab) = self.state.tabs.get(prev_idx) {
+                self.dispatch(DawAction::SwitchToTab(tab.id));
+            }
+        }
+    }
+    
+    // Switch to the next tab in the tabs list
+    pub fn switch_to_next_tab(&mut self) {
+        if self.state.tabs.is_empty() {
+            return;
+        }
+        
+        // Find current tab index
+        let current_index = self.state.tabs.iter().position(|t| t.id == self.state.active_tab_id);
+        
+        if let Some(idx) = current_index {
+            // Calculate next index (wrap around to the beginning)
+            let next_idx = (idx + 1) % self.state.tabs.len();
+            
+            // Switch to the next tab
+            if let Some(tab) = self.state.tabs.get(next_idx) {
+                self.dispatch(DawAction::SwitchToTab(tab.id));
             }
         }
     }
