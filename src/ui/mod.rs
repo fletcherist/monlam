@@ -3,9 +3,8 @@ pub mod main;
 pub mod drag_drop;
 pub mod file_browser;
 pub mod grid;
-pub mod sample;
 pub mod group_panel;
-pub mod group_item;
+pub mod grid_item;
 
 // Only export the modules, don't re-export main
 // as it would bring in all of main's items

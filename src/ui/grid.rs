@@ -4,8 +4,7 @@ use crate::ui::main::{
      SCROLLBAR_SIZE, TRACK_BORDER_COLOR, TRACK_HEIGHT, TRACK_SPACING,
     TRACK_TEXT_COLOR,
 };
-use crate::ui::sample::{self, SampleDragging};
-use crate::ui::group_item::{self, GroupDragging};
+use crate::ui::grid_item::{GridItem, GridItemDragging, GridItemHelper};
 use crate::daw::TrackItemType;
 use egui::{Color32, Stroke};
 
@@ -708,64 +707,44 @@ impl<'a> Grid<'a> {
                 ),
             ) in samples.iter().enumerate()
             {
-                match item_type {
-                    TrackItemType::Sample => {
-                        sample::draw_sample(
-                            ui,
-                            &grid_rect,
-                            &painter,
-                            track_idx,
-                            *track_id,
-                            track_top,
-                            sample_index,
-                            *sample_id,
-                            sample_name,
-                            *position,
-                            *length,
-                            waveform,
-                            *duration,
-                            *audio_start_time,
-                            *audio_end_time,
-                            h_scroll_offset,
-                            seconds_per_pixel,
-                            beats_per_second,
-                            &mut clicked_on_sample_in_track,
-                            &mut sample_dragged_this_frame,
-                            &snap_to_grid,
-                            &mut self.on_selection_change,
-                            &mut self.on_track_drag,
-                        );
+                // Create a GridItem for this sample/group
+                let grid_item = GridItem {
+                    track_idx,
+                    track_id: *track_id,
+                    track_top,
+                    item_index: sample_index,
+                    item_id: *sample_id,
+                    item_name: sample_name,
+                    position: *position,
+                    length: *length,
+                    waveform,
+                    sample_rate: *sample_rate,
+                    duration: *duration,
+                    audio_start_time: *audio_start_time,
+                    audio_end_time: *audio_end_time,
+                    item_type: *item_type,
+                };
+                
+                // Draw the item using our unified interface
+                grid_item.draw(
+                    ui,
+                    &grid_rect,
+                    &painter,
+                    h_scroll_offset,
+                    seconds_per_pixel,
+                    beats_per_second,
+                    &mut clicked_on_sample_in_track,
+                    &mut sample_dragged_this_frame,
+                    &snap_to_grid,
+                    &mut self.on_selection_change,
+                    &mut self.on_track_drag,
+                    // Only provide the on_group_double_click for groups
+                    if *item_type == TrackItemType::Group {
+                        Some(&mut self.on_group_double_click)
+                    } else {
+                        None
                     },
-                    TrackItemType::Group => {
-                        group_item::draw_group(
-                            ui,
-                            &grid_rect,
-                            &painter,
-                            track_idx,
-                            *track_id,
-                            track_top,
-                            sample_index,
-                            *sample_id,
-                            sample_name,
-                            *position,
-                            *length,
-                            waveform,
-                            *sample_rate,
-                            *duration,
-                            *audio_start_time,
-                            *audio_end_time,
-                            h_scroll_offset,
-                            seconds_per_pixel,
-                            beats_per_second,
-                            &mut clicked_on_sample_in_track,
-                            &mut sample_dragged_this_frame,
-                            &snap_to_grid,
-                            &mut self.on_selection_change,
-                            &mut self.on_track_drag,
-                            &mut self.on_group_double_click,
-                        );
-                    }
-                }
+                );
             }
         }
 
@@ -773,12 +752,13 @@ impl<'a> Grid<'a> {
         if let Some((drag_track_id, drag_sample_id, click_offset_beats)) = dragged_sample {
             if ui.input(|i| i.pointer.primary_down()) {
                 // Only process active drag if mouse button is still down
-                sample::GridSampleHelper::process_active_drag(
+                GridItemHelper::process_active_drag(
                     ui,
                     &grid_rect,
                     &self.tracks,
                     drag_track_id,
                     drag_sample_id,
+                    TrackItemType::Sample,
                     click_offset_beats,
                     &screen_x_to_beat,
                     &screen_y_to_track_index,
@@ -795,12 +775,13 @@ impl<'a> Grid<'a> {
         if let Some((drag_track_id, drag_group_id, click_offset_beats)) = dragged_group {
             if ui.input(|i| i.pointer.primary_down()) {
                 // Only process active drag if mouse button is still down
-                group_item::GridGroupHelper::process_active_drag(
+                GridItemHelper::process_active_drag(
                     ui,
                     &grid_rect,
                     &self.tracks,
                     drag_track_id,
                     drag_group_id,
+                    TrackItemType::Group,
                     click_offset_beats,
                     &screen_x_to_beat,
                     &screen_y_to_track_index,
@@ -818,23 +799,29 @@ impl<'a> Grid<'a> {
             // End of drag for sample
             if let Some((drag_track_id, drag_sample_id, _)) = dragged_sample {
                 // Clear the dragged sample reference
-                ui.memory_mut(|mem| {
-                    *mem.data
-                        .get_persisted_mut_or_default::<Option<(usize, usize, f32)>>(
-                            ui.id().with("dragged_sample"),
-                        ) = None;
-                });
+                GridItemHelper::end_item_drag(
+                    ui,
+                    TrackItemType::Sample,
+                    &self.tracks,
+                    drag_track_id,
+                    drag_sample_id,
+                    self.selection.as_ref(),
+                    &mut self.on_selection_change,
+                );
             }
             
             // End of drag for group
             if let Some((drag_track_id, drag_group_id, _)) = dragged_group {
                 // Clear the dragged group reference
-                ui.memory_mut(|mem| {
-                    *mem.data
-                        .get_persisted_mut_or_default::<Option<(usize, usize, f32)>>(
-                            ui.id().with("dragged_group"),
-                        ) = None;
-                });
+                GridItemHelper::end_item_drag(
+                    ui,
+                    TrackItemType::Group,
+                    &self.tracks,
+                    drag_track_id,
+                    drag_group_id,
+                    self.selection.as_ref(),
+                    &mut self.on_selection_change,
+                );
             }
         }
 
@@ -1368,254 +1355,3 @@ impl<'a> GridZooming for Grid<'a> {
     }
 }
 
-// Implement the SampleDragging trait for Grid by delegating to GridSampleHelper
-impl<'a> sample::SampleDragging for Grid<'a> {
-    fn handle_sample_dragging(
-        ui: &mut egui::Ui,
-        grid_rect: &egui::Rect,
-        tracks: &Vec<(
-            usize,
-            String,
-            bool,
-            bool,
-            bool,
-            Vec<(usize, String, f32, f32, Vec<f32>, u32, f32, f32, f32, TrackItemType)>,
-        )>,
-        drag_track_id: usize,
-        drag_sample_id: usize,
-        click_offset_beats: f32,
-        screen_x_to_beat: &dyn Fn(f32) -> f32,
-        screen_y_to_track_index: &dyn Fn(f32) -> Option<usize>,
-        snap_to_grid: &dyn Fn(f32) -> f32,
-        sample_dragged_this_frame: &mut bool,
-        on_cross_track_move: &mut dyn FnMut(usize, usize, usize, f32),
-        on_track_drag: &mut dyn FnMut(usize, usize, f32),
-    ) {
-        sample::GridSampleHelper::handle_sample_dragging(
-            ui,
-            grid_rect,
-            tracks,
-            drag_track_id,
-            drag_sample_id,
-            click_offset_beats,
-            screen_x_to_beat,
-            screen_y_to_track_index,
-            snap_to_grid,
-            sample_dragged_this_frame,
-            on_cross_track_move,
-            on_track_drag,
-        )
-    }
-
-    fn process_active_drag(
-        ui: &mut egui::Ui,
-        grid_rect: &egui::Rect,
-        tracks: &Vec<(
-            usize,
-            String,
-            bool,
-            bool,
-            bool,
-            Vec<(usize, String, f32, f32, Vec<f32>, u32, f32, f32, f32, TrackItemType)>,
-        )>,
-        drag_track_id: usize,
-        drag_sample_id: usize,
-        click_offset_beats: f32,
-        screen_x_to_beat: &dyn Fn(f32) -> f32,
-        screen_y_to_track_index: &dyn Fn(f32) -> Option<usize>,
-        snap_to_grid: &dyn Fn(f32) -> f32,
-        sample_dragged_this_frame: &mut bool,
-        on_cross_track_move: &mut dyn FnMut(usize, usize, usize, f32),
-        on_track_drag: &mut dyn FnMut(usize, usize, f32),
-        on_selection_change: &mut dyn FnMut(Option<SelectionRect>),
-    ) {
-        sample::GridSampleHelper::process_active_drag(
-            ui,
-            grid_rect,
-            tracks,
-            drag_track_id,
-            drag_sample_id,
-            click_offset_beats,
-            screen_x_to_beat,
-            screen_y_to_track_index,
-            snap_to_grid,
-            sample_dragged_this_frame,
-            on_cross_track_move,
-            on_track_drag,
-            on_selection_change,
-        )
-    }
-
-    fn move_sample(
-        ui: &mut egui::Ui,
-        source_track_id: usize,
-        sample_id: usize,
-        target_track_id: usize,
-        new_position: f32,
-        click_offset_beats: f32,
-        on_cross_track_move: &mut dyn FnMut(usize, usize, usize, f32),
-        on_track_drag: &mut dyn FnMut(usize, usize, f32),
-    ) {
-        sample::GridSampleHelper::move_sample(
-            ui,
-            source_track_id,
-            sample_id,
-            target_track_id,
-            new_position,
-            click_offset_beats,
-            on_cross_track_move,
-            on_track_drag,
-        )
-    }
-
-    fn end_sample_drag(
-        ui: &mut egui::Ui,
-        tracks: &Vec<(
-            usize,
-            String,
-            bool,
-            bool,
-            bool,
-            Vec<(usize, String, f32, f32, Vec<f32>, u32, f32, f32, f32, TrackItemType)>,
-        )>,
-        drag_track_id: usize,
-        drag_sample_id: usize,
-        selection: Option<&SelectionRect>,
-        on_selection_change: &mut dyn FnMut(Option<SelectionRect>),
-    ) {
-        sample::GridSampleHelper::end_sample_drag(
-            ui,
-            tracks,
-            drag_track_id,
-            drag_sample_id,
-            selection,
-            on_selection_change,
-        )
-    }
-}
-
-// Also implement the GroupDragging trait for Grid by delegating to GridGroupHelper
-impl<'a> group_item::GroupDragging for Grid<'a> {
-    fn handle_group_dragging(
-        ui: &mut egui::Ui,
-        grid_rect: &egui::Rect,
-        tracks: &Vec<(
-            usize,
-            String,
-            bool,
-            bool,
-            bool,
-            Vec<(usize, String, f32, f32, Vec<f32>, u32, f32, f32, f32, TrackItemType)>,
-        )>,
-        drag_track_id: usize,
-        drag_group_id: usize,
-        click_offset_beats: f32,
-        screen_x_to_beat: &dyn Fn(f32) -> f32,
-        screen_y_to_track_index: &dyn Fn(f32) -> Option<usize>,
-        snap_to_grid: &dyn Fn(f32) -> f32,
-        item_dragged_this_frame: &mut bool,
-        on_cross_track_move: &mut dyn FnMut(usize, usize, usize, f32),
-        on_track_drag: &mut dyn FnMut(usize, usize, f32),
-    ) {
-        group_item::GridGroupHelper::handle_group_dragging(
-            ui,
-            grid_rect,
-            tracks,
-            drag_track_id,
-            drag_group_id,
-            click_offset_beats,
-            screen_x_to_beat,
-            screen_y_to_track_index,
-            snap_to_grid,
-            item_dragged_this_frame,
-            on_cross_track_move,
-            on_track_drag,
-        )
-    }
-
-    fn process_active_drag(
-        ui: &mut egui::Ui,
-        grid_rect: &egui::Rect,
-        tracks: &Vec<(
-            usize,
-            String,
-            bool,
-            bool,
-            bool,
-            Vec<(usize, String, f32, f32, Vec<f32>, u32, f32, f32, f32, TrackItemType)>,
-        )>,
-        drag_track_id: usize,
-        drag_group_id: usize,
-        click_offset_beats: f32,
-        screen_x_to_beat: &dyn Fn(f32) -> f32,
-        screen_y_to_track_index: &dyn Fn(f32) -> Option<usize>,
-        snap_to_grid: &dyn Fn(f32) -> f32,
-        item_dragged_this_frame: &mut bool,
-        on_cross_track_move: &mut dyn FnMut(usize, usize, usize, f32),
-        on_track_drag: &mut dyn FnMut(usize, usize, f32),
-        on_selection_change: &mut dyn FnMut(Option<SelectionRect>),
-    ) {
-        group_item::GridGroupHelper::process_active_drag(
-            ui,
-            grid_rect,
-            tracks,
-            drag_track_id,
-            drag_group_id,
-            click_offset_beats,
-            screen_x_to_beat,
-            screen_y_to_track_index,
-            snap_to_grid,
-            item_dragged_this_frame,
-            on_cross_track_move,
-            on_track_drag,
-            on_selection_change,
-        )
-    }
-
-    fn move_group(
-        ui: &mut egui::Ui,
-        source_track_id: usize,
-        group_id: usize,
-        target_track_id: usize,
-        new_position: f32,
-        click_offset_beats: f32,
-        on_cross_track_move: &mut dyn FnMut(usize, usize, usize, f32),
-        on_track_drag: &mut dyn FnMut(usize, usize, f32),
-    ) {
-        group_item::GridGroupHelper::move_group(
-            ui,
-            source_track_id,
-            group_id,
-            target_track_id,
-            new_position,
-            click_offset_beats,
-            on_cross_track_move,
-            on_track_drag,
-        )
-    }
-
-    fn end_group_drag(
-        ui: &mut egui::Ui,
-        tracks: &Vec<(
-            usize,
-            String,
-            bool,
-            bool,
-            bool,
-            Vec<(usize, String, f32, f32, Vec<f32>, u32, f32, f32, f32, TrackItemType)>,
-        )>,
-        drag_track_id: usize,
-        drag_group_id: usize,
-        selection: Option<&SelectionRect>,
-        on_selection_change: &mut dyn FnMut(Option<SelectionRect>),
-    ) {
-        group_item::GridGroupHelper::end_group_drag(
-            ui,
-            tracks,
-            drag_track_id,
-            drag_group_id,
-            selection,
-            on_selection_change,
-        )
-    }
-}
