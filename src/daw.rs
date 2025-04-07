@@ -664,6 +664,8 @@ pub struct DawState {
     pub tabs: Vec<Tab>, // List of open tabs
     #[serde(default)]
     pub active_tab_id: usize, // Currently active tab ID
+    #[serde(default)]
+    pub audio_boxes: Vec<String>, // List of AudioBox names in this project
 }
 
 fn default_zoom_level() -> f32 {
@@ -707,6 +709,7 @@ impl Default for DawState {
             loop_range: None,
             tabs: default_tabs(),
             active_tab_id: 0,
+            audio_boxes: Vec::new(),
         }
     }
 }
@@ -971,6 +974,36 @@ impl DawApp {
 
                             sample.is_playing = false;
                             sample.current_position = 0.0;
+                        }
+                    }
+                }
+                
+                // Scan for AudioBoxes in the project directory
+                if loaded_state.audio_boxes.is_empty() {
+                    // Only scan if we don't have any boxes in our state
+                    if let Ok(entries) = std::fs::read_dir(&project_folder) {
+                        for entry in entries.filter_map(|e| e.ok()) {
+                            let path = entry.path();
+                            if path.is_dir() {
+                                // Skip the waveforms directory 
+                                if path.file_name().and_then(|n| n.to_str()) == Some("waveforms") {
+                                    continue;
+                                }
+                                
+                                // Check if this directory has a render.wav or state.json file
+                                let render_path = path.join("render.wav");
+                                let state_path = path.join("state.json");
+                                
+                                if render_path.exists() || state_path.exists() {
+                                    // This is likely an AudioBox
+                                    if let Some(box_name) = path.file_name().and_then(|n| n.to_str()) {
+                                        if !loaded_state.audio_boxes.contains(&box_name.to_string()) {
+                                            loaded_state.audio_boxes.push(box_name.to_string());
+                                            eprintln!("Found AudioBox: {}", box_name);
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -1500,15 +1533,60 @@ impl DawApp {
                 if let Some(project_path) = self.state.file_path.as_ref() {
                     if let Some(project_dir) = project_path.parent() {
                         match AudioBox::new(&name, project_dir) {
-                            Ok(audio_box) => {
+                            Ok(_) => {
                                 eprintln!("Created new AudioBox: {}", name);
+                                
+                                // Add this AudioBox to the list of known boxes
+                                if !self.state.audio_boxes.contains(&name) {
+                                    self.state.audio_boxes.push(name.clone());
+                                }
+                                
+                                // Create samples directory for the AudioBox
+                                let box_path = project_dir.join(&name);
+                                let samples_dir = box_path.join("samples");
+                                if !samples_dir.exists() {
+                                    if let Err(e) = std::fs::create_dir_all(&samples_dir) {
+                                        eprintln!("Failed to create samples directory: {}", e);
+                                    }
+                                }
+                                
+                                // Copy selected samples to the AudioBox if there's a selection
+                                if let Some(selection) = &self.state.selection {
+                                    let mut copied_samples = 0;
+                                    
+                                    // Iterate through selected tracks
+                                    for track_idx in selection.start_track_idx..=selection.end_track_idx {
+                                        if let Some(track) = self.state.tracks.get(track_idx) {
+                                            // Find samples within the beat range
+                                            for sample in &track.samples {
+                                                if sample.grid_position + sample.grid_length >= selection.start_beat && 
+                                                   sample.grid_position <= selection.end_beat {
+                                                    if let Some(source_path) = &sample.audio_file {
+                                                        if source_path.exists() {
+                                                            let filename = source_path.file_name().unwrap_or_else(|| std::ffi::OsStr::new("sample.wav"));
+                                                            let target_path = samples_dir.join(filename);
+                                                            
+                                                            // Copy the file
+                                                            if let Err(e) = std::fs::copy(source_path, &target_path) {
+                                                                eprintln!("Failed to copy sample to AudioBox: {}", e);
+                                                            } else {
+                                                                copied_samples += 1;
+                                                                eprintln!("Copied sample to AudioBox: {:?}", target_path);
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    
+                                    eprintln!("Copied {} samples to AudioBox '{}'", copied_samples, name);
+                                }
                             }
                             Err(e) => {
                                 eprintln!("Failed to create AudioBox: {}", e);
                             }
                         }
-                    } else {
-                        eprintln!("Cannot determine project directory");
                     }
                 } else {
                     eprintln!("No project file path set, cannot create AudioBox");
@@ -1519,12 +1597,26 @@ impl DawApp {
                 if let Some(project_path) = self.state.file_path.as_ref() {
                     if let Some(project_dir) = project_path.parent() {
                         let box_path = project_dir.join(&old_name);
-                        if box_path.exists() && box_path.is_dir() {
-                            if let Ok(mut audio_box) = AudioBox::load(&box_path) {
-                                if let Err(e) = audio_box.rename(&new_name, project_dir) {
-                                    eprintln!("Failed to rename AudioBox: {}", e);
+                        if let Ok(mut audio_box) = AudioBox::load(&box_path) {
+                            if let Err(e) = audio_box.rename(&new_name, project_dir) {
+                                eprintln!("Failed to rename AudioBox: {}", e);
+                            } else {
+                                // Update the entry in audio_boxes
+                                if let Some(index) = self.state.audio_boxes.iter().position(|n| n == &old_name) {
+                                    self.state.audio_boxes[index] = new_name.clone();
                                 } else {
-                                    eprintln!("Renamed AudioBox from {} to {}", old_name, new_name);
+                                    // If not found, add it
+                                    self.state.audio_boxes.push(new_name.clone());
+                                }
+                                
+                                eprintln!("Renamed AudioBox from {} to {}", old_name, new_name);
+                                
+                                // Update tab names for this AudioBox
+                                for tab in &mut self.state.tabs {
+                                    if tab.is_audio_box && tab.audio_box_name.as_ref().map_or(false, |n| n == &old_name) {
+                                        tab.name = format!("Box: {}", new_name);
+                                        tab.audio_box_name = Some(new_name.clone());
+                                    }
                                 }
                             }
                         }
@@ -1536,11 +1628,36 @@ impl DawApp {
                 if let Some(project_path) = self.state.file_path.as_ref() {
                     if let Some(project_dir) = project_path.parent() {
                         let box_path = project_dir.join(&name);
-                        if box_path.exists() && box_path.is_dir() {
+                        if box_path.exists() {
                             if let Err(e) = std::fs::remove_dir_all(&box_path) {
                                 eprintln!("Failed to delete AudioBox: {}", e);
                             } else {
+                                // Remove the entry from audio_boxes
+                                if let Some(index) = self.state.audio_boxes.iter().position(|n| n == &name) {
+                                    self.state.audio_boxes.remove(index);
+                                }
+                                
                                 eprintln!("Deleted AudioBox: {}", name);
+                                
+                                // Also close any open tabs for this box
+                                let tabs_to_close: Vec<usize> = self.state.tabs.iter()
+                                    .filter(|t| t.is_audio_box && t.audio_box_name.as_ref().map_or(false, |n| n == &name))
+                                    .map(|t| t.id)
+                                    .collect();
+                                
+                                for tab_id in tabs_to_close {
+                                    if let Some(tab_index) = self.state.tabs.iter().position(|t| t.id == tab_id) {
+                                        self.state.tabs.remove(tab_index);
+                                        eprintln!("Closed tab for deleted AudioBox: {}", name);
+                                    }
+                                }
+                                
+                                // If we removed the active tab, switch to the first tab
+                                if self.state.tabs.iter().find(|t| t.id == self.state.active_tab_id).is_none() {
+                                    if let Some(first_tab) = self.state.tabs.first() {
+                                        self.state.active_tab_id = first_tab.id;
+                                    }
+                                }
                             }
                         }
                     }
@@ -1718,10 +1835,130 @@ impl DawApp {
             }
             DawAction::OpenBoxInNewTab(box_name) => {
                 // Implementation of opening an AudioBox in a new tab
+                // First check if we already have a tab open for this box
+                if let Some(existing_tab) = self.state.tabs.iter().find(|t| 
+                    t.is_audio_box && 
+                    t.audio_box_name.as_ref().map_or(false, |name| name == &box_name)
+                ) {
+                    // Stop any current playback before switching tabs
+                    if self.state.is_playing {
+                        self.state.is_playing = false;
+                        
+                        // Make sure all samples are paused
+                        for track in &mut self.state.tracks {
+                            for sample in &mut track.samples {
+                                if sample.is_playing {
+                                    sample.pause();
+                                }
+                            }
+                        }
+                        
+                        eprintln!("Paused playback when opening box in existing tab");
+                    }
+                    
+                    // Box is already open in a tab, switch to it
+                    self.state.active_tab_id = existing_tab.id;
+                    eprintln!("Switched to existing tab for AudioBox '{}'", box_name);
+                    return;
+                }
+                
+                // Stop any current playback before creating a new tab
+                if self.state.is_playing {
+                    self.state.is_playing = false;
+                    
+                    // Make sure all samples are paused
+                    for track in &mut self.state.tracks {
+                        for sample in &mut track.samples {
+                            if sample.is_playing {
+                                sample.pause();
+                            }
+                        }
+                    }
+                    
+                    eprintln!("Paused playback when opening box in new tab");
+                }
+                
                 if let Some(project_path) = self.state.file_path.as_ref() {
                     if let Some(project_dir) = project_path.parent() {
                         let box_path = project_dir.join(&box_name);
                         if box_path.exists() && box_path.is_dir() {
+                            // Check if there's a state.json file for the full state
+                            let box_state_path = box_path.join("state.json");
+                            if box_state_path.exists() {
+                                eprintln!("Found state.json file for AudioBox '{}'", box_name);
+                                
+                                // Load the state from the file
+                                if let Ok(contents) = fs::read_to_string(&box_state_path) {
+                                    if let Ok(mut loaded_state) = serde_json::from_str::<DawState>(&contents) {
+                                        // Create a new tab for this audio box
+                                        let tab_id = if self.state.tabs.is_empty() {
+                                            0
+                                        } else {
+                                            self.state.tabs.iter().map(|t| t.id).max().unwrap_or(0) + 1
+                                        };
+                                        
+                                        // Create a new tab
+                                        let tab = Tab {
+                                            id: tab_id,
+                                            name: format!("Box: {}", box_name),
+                                            is_audio_box: true,
+                                            audio_box_name: Some(box_name.clone()),
+                                        };
+                                        
+                                        // Store the current state
+                                        let current_state = self.state.clone();
+                                        
+                                        // Replace the state with the loaded state
+                                        self.state = loaded_state;
+                                        
+                                        // But keep some settings from the current state
+                                        self.state.tabs = current_state.tabs;
+                                        self.state.tabs.push(tab);
+                                        self.state.active_tab_id = tab_id;
+                                        
+                                        // Load audio data for all samples
+                                        for track in &mut self.state.tracks {
+                                            for sample in &mut track.samples {
+                                                if let Some(path) = &sample.audio_file {
+                                                    match load_audio(path) {
+                                                        Ok((samples, sample_rate)) => {
+                                                            // Initialize sample with loaded audio data
+                                                            let buffer = Arc::new(Mutex::new(samples.clone()));
+                                                            sample.audio_buffer = buffer;
+                                                            
+                                                            // Initialize sample index
+                                                            sample.sample_index = Arc::new(AtomicUsize::new(0));
+                                                            
+                                                            // Create audio stream
+                                                            sample.create_stream(&self.audio);
+                                                            
+                                                            // Generate waveform
+                                                            let duration = samples.len() as f32 / sample_rate as f32;
+                                                            sample.waveform = Some(SampleWaveform {
+                                                                samples: generate_waveform(&samples, 1000),
+                                                                sample_rate,
+                                                                duration,
+                                                            });
+                                                        }
+                                                        Err(e) => {
+                                                            eprintln!("Error loading audio: {:?}", e);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        
+                                        eprintln!("Loaded full state for AudioBox '{}'", box_name);
+                                        return;
+                                    } else {
+                                        eprintln!("Failed to parse AudioBox state file");
+                                    }
+                                } else {
+                                    eprintln!("Failed to read AudioBox state file");
+                                }
+                            }
+                            
+                            // Fallback to the old method if no state.json file or failed to load it
                             // Create a new tab for this audio box
                             let tab_id = if self.state.tabs.is_empty() {
                                 0
@@ -1842,6 +2079,28 @@ impl DawApp {
             DawAction::SwitchToTab(tab_id) => {
                 // Implementation of switching to a different tab
                 if let Some(tab) = self.state.tabs.iter().find(|t| t.id == tab_id) {
+                    // Check if we're switching between different tab types (audio box vs project)
+                    let current_tab = self.state.tabs.iter().find(|t| t.id == self.state.active_tab_id);
+                    let is_switching_tab_types = current_tab.map_or(false, |current| {
+                        current.is_audio_box != tab.is_audio_box
+                    });
+                    
+                    // If we're switching between tab types and playback is active, pause playback
+                    if is_switching_tab_types && self.state.is_playing {
+                        self.state.is_playing = false;
+                        
+                        // Make sure all samples are paused
+                        for track in &mut self.state.tracks {
+                            for sample in &mut track.samples {
+                                if sample.is_playing {
+                                    sample.pause();
+                                }
+                            }
+                        }
+                        
+                        eprintln!("Paused playback when switching between different editor types");
+                    }
+                    
                     self.state.active_tab_id = tab_id;
                     eprintln!("Switched to tab: {}", tab.name);
                 } else {
@@ -1851,7 +2110,31 @@ impl DawApp {
             DawAction::CloseTab(tab_id) => {
                 // Implementation of closing a tab
                 if let Some(tab_index) = self.state.tabs.iter().position(|t| t.id == tab_id) {
+                    // Stop any current playback when closing a tab
+                    if self.state.is_playing {
+                        self.state.is_playing = false;
+                        
+                        // Make sure all samples are paused
+                        for track in &mut self.state.tracks {
+                            for sample in &mut track.samples {
+                                if sample.is_playing {
+                                    sample.pause();
+                                }
+                            }
+                        }
+                        
+                        eprintln!("Paused playback when closing tab");
+                    }
+                    
                     self.state.tabs.remove(tab_index);
+                    
+                    // If we're closing the active tab, switch to another tab
+                    if self.state.active_tab_id == tab_id {
+                        if let Some(first_tab) = self.state.tabs.first() {
+                            self.state.active_tab_id = first_tab.id;
+                        }
+                    }
+                    
                     eprintln!("Closed tab: {}", tab_id);
                 } else {
                     eprintln!("Tab not found: {}", tab_id);
@@ -1880,16 +2163,37 @@ impl DawApp {
                             }
                         }
                         
-                        // Save project state to the box directory
-                        // TODO: Save full project state to support multi-track audio boxes
+                        // Save full project state to support multi-track audio boxes
+                        let box_state_path = box_path.join("state.json");
                         
-                        // Render tracks to a single audio file
                         if let Some(tab) = self.state.tabs.iter().find(|t| 
                             t.is_audio_box && 
                             t.audio_box_name.as_ref().map_or(false, |name| name == &box_name)
                         ) {
-                            // Render all tracks to a single audio file
-                            // We can reuse the render selection logic
+                            // Create a copy of the current state to save
+                            let mut box_state = self.state.clone();
+                            
+                            // Keep track of this AudioBox in the main project
+                            if !self.state.audio_boxes.contains(&box_name) {
+                                self.state.audio_boxes.push(box_name.clone());
+                            }
+                            
+                            // Update metadata
+                            box_state.project_name = box_name.clone();
+                            box_state.file_path = Some(box_state_path.clone());
+                            
+                            // Serialize and save the state
+                            if let Ok(serialized) = serde_json::to_string_pretty(&box_state) {
+                                if let Err(e) = fs::write(&box_state_path, serialized) {
+                                    eprintln!("Failed to write AudioBox state file: {:?}", e);
+                                } else {
+                                    eprintln!("Saved full state for AudioBox '{}'", box_name);
+                                }
+                            } else {
+                                eprintln!("Failed to serialize AudioBox state");
+                            }
+                            
+                            // Render tracks to a single audio file
                             let render_path = box_path.join("render.wav");
                             
                             // For now, just mix all active samples
@@ -2006,6 +2310,11 @@ impl DawApp {
             let mut any_sample_playing = false;
 
             let any_track_soloed = self.state.tracks.iter().any(|t| t.soloed);
+            
+            // Check if we're in an audio box tab
+            let active_tab = self.state.tabs.iter().find(|t| t.id == self.state.active_tab_id);
+            let is_audio_box_tab = active_tab.map_or(false, |tab| tab.is_audio_box);
+            let audio_box_name = active_tab.and_then(|tab| tab.audio_box_name.clone());
 
             for track in &mut self.state.tracks {
                 if track.muted || (any_track_soloed && !track.soloed) {
@@ -2013,6 +2322,41 @@ impl DawApp {
                 }
 
                 for sample in &mut track.samples {
+                    // Skip samples that don't belong to the current tab type
+                    if is_audio_box_tab {
+                        // In an audio box tab, only play samples with item_type == AudioBox that
+                        // match the current audio box name
+                        match &sample.item_type {
+                            TrackItemType::AudioBox => {
+                                // If this sample doesn't represent the current audio box, skip it
+                                if sample.name != audio_box_name.clone().unwrap_or_default() {
+                                    // Ensure we pause it if it's somehow playing
+                                    if sample.is_playing {
+                                        sample.pause();
+                                    }
+                                    continue;
+                                }
+                            },
+                            TrackItemType::Sample => {
+                                // If we're in an audio box tab, don't play regular samples
+                                // from the project
+                                if sample.is_playing {
+                                    sample.pause();
+                                }
+                                continue;
+                            }
+                        }
+                    } else {
+                        // In the main project tab, only play regular samples, not audio boxes
+                        if let TrackItemType::AudioBox = sample.item_type {
+                            // If we're in the main project tab, don't play AudioBox samples
+                            if sample.is_playing {
+                                sample.pause();
+                            }
+                            continue;
+                        }
+                    }
+                    
                     sample.update_grid_times(self.state.bpm);
                     let should_play = timeline_pos >= sample.grid_start_time
                         && timeline_pos < sample.grid_end_time;
@@ -2108,6 +2452,7 @@ impl DawApp {
                 loop_range: None,
                 tabs: default_tabs(),
                 active_tab_id: 0,
+                audio_boxes: Vec::new(),
             },
             audio: Audio::new(),
             last_update: std::time::Instant::now(),
