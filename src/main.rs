@@ -15,6 +15,6 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "Monlam",
         options,
-        Box::new(|cc| Box::new(DawApp::new(cc))),
+        Box::new(|cc| Ok(Box::new(DawApp::new(cc)))),
     )
 }

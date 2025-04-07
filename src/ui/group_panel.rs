@@ -254,7 +254,7 @@ impl GroupPanel {
             });
             
             // Show drag visual with waveform
-            egui::show_tooltip_at_pointer(ctx, egui::Id::new("group_preview"), |ui| {
+            egui::show_tooltip_at_pointer(ctx, ui.layer_id(), egui::Id::new("group_preview"), |ui| {
                 let preview_width = 200.0;
                 let preview_height = 60.0;
                 
@@ -267,7 +267,7 @@ impl GroupPanel {
                 
                 // Draw Group background
                 painter.rect_filled(rect, 4.0, egui::Color32::from_rgb(60, 60, 70));
-                painter.rect_stroke(rect, 4.0, egui::Stroke::new(1.0, SAMPLE_BORDER_COLOR));
+                painter.rect_stroke(rect, 4.0, egui::Stroke::new(1.0, SAMPLE_BORDER_COLOR), egui::StrokeKind::Inside);
                 
                 // Draw Group name
                 painter.text(

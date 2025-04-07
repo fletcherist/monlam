@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-eframe = "0.24.1"  # egui framework
-egui = "0.24.1"   # egui core
+eframe = "0.31.1"  # egui framework
+egui = "0.31.1"   # egui core
 egui_extras = "0.24.1"  # additional egui widgets
 rfd = "0.12.1"  # native file dialogs
 symphonia = { version = "0.5", features = ["mp3", "wav", "ogg", "flac", "isomp4", "aac", "alac"] }  # audio decoding

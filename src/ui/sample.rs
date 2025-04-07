@@ -70,7 +70,7 @@ pub fn draw_sample(
     };
 
     painter.rect_filled(region_rect, 4.0, sample_color);
-    painter.rect_stroke(region_rect, 4.0, Stroke::new(1.0, SAMPLE_BORDER_COLOR));
+    painter.rect_stroke(region_rect, 4.0, Stroke::new(1.0, SAMPLE_BORDER_COLOR), egui::StrokeKind::Inside);
 
     // Show sample name if there's enough space
     if visible_width > 20.0 {

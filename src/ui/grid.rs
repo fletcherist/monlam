@@ -290,6 +290,7 @@ impl<'a> Grid<'a> {
                                 Color32::from_rgb(150, 150, 150)
                             },
                         ),
+                        egui::StrokeKind::Inside,
                     );
 
                     // Draw start and end handles if visible
@@ -629,16 +630,19 @@ impl<'a> Grid<'a> {
                 mute_rect,
                 4.0,
                 Stroke::new(1.0, Color32::from_rgb(80, 80, 80)),
+                egui::StrokeKind::Inside,
             );
             painter.rect_stroke(
                 solo_rect,
                 4.0,
                 Stroke::new(1.0, Color32::from_rgb(80, 80, 80)),
+                egui::StrokeKind::Inside,
             );
             painter.rect_stroke(
                 record_rect,
                 4.0,
                 Stroke::new(1.0, Color32::from_rgb(80, 80, 80)),
+                egui::StrokeKind::Inside,
             );
 
             // Draw button text
@@ -909,7 +913,7 @@ impl<'a> Grid<'a> {
             painter.rect_filled(selection_rect, 0.0, fill_color);
 
             // Draw border
-            painter.rect_stroke(selection_rect, 0.0, Stroke::new(2.0, stroke_color));
+            painter.rect_stroke(selection_rect, 0.0, Stroke::new(2.0, stroke_color), egui::StrokeKind::Inside);
         }
 
         // Draw playhead adjusted for horizontal scroll
@@ -1068,7 +1072,7 @@ impl<'a> Grid<'a> {
 
         // Handle scrolling with mouse wheel
         if grid_response.hovered() {
-            let scroll_delta = ui.input(|i| i.scroll_delta);
+            let scroll_delta = ui.input(|i| i.smooth_scroll_delta);
             // Vertical scrolling with mouse wheel
             if scroll_delta.y != 0.0 {
                 v_scroll_offset += scroll_delta.y * -0.5; // Adjust sensitivity
@@ -1308,7 +1312,7 @@ impl<'a> GridZooming for Grid<'a> {
         on_zoom_change: &mut dyn FnMut(f32),
     ) {
         // Get the scroll input
-        let scroll_input = ui.input(|i| i.scroll_delta);
+        let scroll_input = ui.input(|i| i.smooth_scroll_delta);
 
         if scroll_input.y != 0.0 {
             // Calculate zoom factor based on scroll direction - reduced sensitivity

@@ -69,7 +69,7 @@ pub fn draw_group(
     painter.rect_filled(region_rect, 4.0, GROUP_COLOR);
     
     // Draw group border with slightly different style from samples
-    painter.rect_stroke(region_rect, 4.0, Stroke::new(1.5, Color32::from_rgb(80, 100, 140)));
+    painter.rect_stroke(region_rect, 4.0, Stroke::new(1.5, Color32::from_rgb(80, 100, 140)), egui::StrokeKind::Inside);
 
     // Show group name with icon if there's enough space
     if visible_width > 20.0 {

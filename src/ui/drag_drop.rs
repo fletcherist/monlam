@@ -36,7 +36,7 @@ pub fn draw_drop_overlay(ctx: &egui::Context, drag_active: bool) {
         eprintln!("Drawing drag overlay over grid rect: {:?}", grid_rect);
         
         // Create a transparent overlay over the grid
-        egui::Area::new("drag_overlay")
+        egui::Area::new(egui::Id::new("drag_overlay"))
             .fixed_pos(egui::pos2(grid_rect.left(), grid_rect.top()))
             .show(ctx, |ui| {
                 let overlay_rect = egui::Rect::from_min_size(
@@ -56,6 +56,7 @@ pub fn draw_drop_overlay(ctx: &egui::Context, drag_active: bool) {
                     overlay_rect,
                     4.0,
                     egui::Stroke::new(2.0, egui::Color32::from_rgba_premultiplied(0, 120, 255, 160)),
+                    egui::StrokeKind::Inside,
                 );
                 
                 // Add drop text

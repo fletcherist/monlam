@@ -145,7 +145,10 @@ impl FileBrowserPanel {
                         });
                         
                         // Show drag visual
-                        egui::show_tooltip_at_pointer(ctx, id, |ui| {
+                        egui::show_tooltip_at_pointer(ctx, 
+                            ui.layer_id(),
+                            egui::Id::new("drag_file"),
+                            |ui| {
                             ui.label(format!("{} {}", icon, name));
                         });
                     }
