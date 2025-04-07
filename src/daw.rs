@@ -27,6 +27,7 @@ pub struct SelectionRect {
 pub enum DawAction {
     SetTimelinePosition(f32),
     SetLastClickedBar(f32),
+    SetClickedPosition(f32), // New action to update only the clicked position
     TogglePlayback,
     SetBpm(f32),
     SetGridDivision(f32),
@@ -598,6 +599,8 @@ pub struct DawState {
     pub grid_division: f32,
     #[serde(skip)]
     pub last_clicked_bar: f32,
+    #[serde(skip)]
+    pub last_clicked_position: f32, // Store the position of the last clicked track marker
     pub project_name: String,
     pub file_path: Option<PathBuf>,
     #[serde(default)]
@@ -652,6 +655,7 @@ impl Default for DawState {
                 .collect(),
             grid_division: 0.25,
             last_clicked_bar: 0.0,
+            last_clicked_position: 0.0, // Store the position of the last clicked track marker
             project_name: String::new(),
             file_path: None,
             h_scroll_offset: 0.0,
@@ -1047,6 +1051,8 @@ impl DawApp {
                 self.state.last_clicked_bar = position;
                 // Also update timeline position immediately
                 self.state.timeline_position = position;
+                // Update last_clicked_position too unless it's explicitly set elsewhere
+                self.state.last_clicked_position = position;
                 for track in &mut self.state.tracks {
                     for sample in &mut track.samples {
                         sample.update_grid_times(self.state.bpm);
@@ -1056,6 +1062,12 @@ impl DawApp {
                         }
                     }
                 }
+            }
+            DawAction::SetClickedPosition(position) => {
+                // Only update the clicked position marker without affecting the playhead
+                self.state.last_clicked_position = position;
+                // No need to update sample playback positions
+                eprintln!("Setting clicked position to: {}", position);
             }
             DawAction::TogglePlayback => {
                 let was_playing = self.state.is_playing;
@@ -1071,8 +1083,12 @@ impl DawApp {
                         }
                     }
 
-                    // If we have a clicked position, prepare to seek there
-                    if self.state.last_clicked_bar > 0.0 {
+                    // Start playback from the blue marker position if it exists
+                    if self.state.last_clicked_position > 0.0 {
+                        self.state.timeline_position = self.state.last_clicked_position;
+                    }
+                    // Otherwise, use the clicked bar position if set
+                    else if self.state.last_clicked_bar > 0.0 {
                         self.state.timeline_position = self.state.last_clicked_bar;
                     }
 
@@ -2351,6 +2367,7 @@ impl DawApp {
                 bpm,
                 grid_division: 0.25,
                 last_clicked_bar: 0.0,
+                last_clicked_position: 0.0, // Store the position of the last clicked track marker
                 project_name: "Test Project".to_string(),
                 file_path: None,
                 h_scroll_offset: 0.0,

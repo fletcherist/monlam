@@ -3,14 +3,10 @@ use crate::group::Group;
 use crate::ui::grid::Grid;
 use crate::ui::file_browser::FileBrowserPanel;
 use crate::ui::group_panel::GroupPanel;
-use crate::audio::Audio;
 use crate::ui::drag_drop;
 use eframe::egui;
-use egui::{Color32, Key, RichText, Stroke};
+use egui::{Color32, Key, RichText};
 use rfd::FileDialog;
-use std::cell::RefCell;
-use std::path::{Path, PathBuf};
-use std::rc::Rc;
 
 // UI Constants
 pub const TRACK_HEIGHT: f32 = 100.0;
@@ -18,12 +14,13 @@ pub const TRACK_SPACING: f32 = 8.0;
 pub const GRID_BACKGROUND: Color32 = Color32::from_rgb(30, 30, 30);
 pub const BAR_LINE_COLOR: Color32 = Color32::from_rgb(60, 60, 60);
 pub const BEAT_LINE_COLOR: Color32 = Color32::from_rgb(50, 50, 50);
-pub const PLAYHEAD_COLOR: Color32 = Color32::from_rgb(255, 50, 50);
+pub const PLAYHEAD_COLOR: Color32 = Color32::from_rgb(255, 255, 255); // White color for playhead
 pub const TRACK_BORDER_COLOR: Color32 = Color32::from_rgb(60, 60, 60);
 pub const TRACK_TEXT_COLOR: Color32 = Color32::from_rgb(200, 200, 200);
 pub const WAVEFORM_COLOR: Color32 = Color32::from_rgb(100, 100, 100);
 pub const SAMPLE_BORDER_COLOR: Color32 = Color32::from_rgb(60, 60, 60);
 pub const GROUP_COLOR: Color32 = Color32::from_rgb(100, 120, 180); // Distinct blue color for Group samples
+pub const SELECTION_COLOR: Color32 = Color32::from_rgb(50, 100, 255); // Blue color for selected bars/elements
 pub const SCROLLBAR_SIZE: f32 = 14.0;
 pub const BASE_PIXELS_PER_BEAT: f32 = 50.0; // Base pixels per beat at zoom level 1.0
 
@@ -158,149 +155,6 @@ impl<'a> TransportControls<'a> {
     }
 }
 
-struct TrackControls<'a> {
-    tracks: Vec<(
-        usize,
-        String,
-        bool,
-        bool,
-        bool,
-        Vec<(usize, String, f32, f32, f32, f32, f32, f32)>,
-    )>, // Track ID, Name, muted, soloed, recording, samples: (Sample ID, name, position, length, current position, duration, trim_start, trim_end)
-    on_sample_start_change: &'a mut dyn FnMut(usize, usize, f32), // track_id, sample_id, position
-    on_sample_length_change: &'a mut dyn FnMut(usize, usize, f32), // track_id, sample_id, length
-    on_track_file_select: &'a mut dyn FnMut(usize),               // track_id
-    on_track_mute: &'a mut dyn FnMut(usize),                      // track_id
-    on_track_solo: &'a mut dyn FnMut(usize),                      // track_id
-    on_track_record: &'a mut dyn FnMut(usize),                    // track_id
-    on_sample_trim_change: &'a mut dyn FnMut(usize, usize, f32, f32), // track_id, sample_id, trim_start, trim_end
-}
-
-impl<'a> TrackControls<'a> {
-    fn draw(&mut self, ui: &mut egui::Ui) {
-        for (track_id, name, muted, soloed, recording, samples) in &self.tracks {
-            ui.horizontal(|ui| {
-                ui.add_space(8.0);
-                ui.label(RichText::new(format!("{}:", name)).size(14.0));
-
-                ui.add_space(8.0);
-                if ui.button(RichText::new("Add Sample").size(14.0)).clicked() {
-                    (self.on_track_file_select)(*track_id);
-                }
-
-                ui.add_space(ui.available_width() - 100.0);
-
-                // Track controls
-                if ui
-                    .button(RichText::new(if *muted { "🔇" } else { "M" }).size(14.0))
-                    .clicked()
-                {
-                    (self.on_track_mute)(*track_id);
-                }
-                if ui
-                    .button(RichText::new(if *soloed { "S!" } else { "S" }).size(14.0))
-                    .clicked()
-                {
-                    (self.on_track_solo)(*track_id);
-                }
-                if ui
-                    .button(RichText::new(if *recording { "⏺" } else { "R" }).size(14.0))
-                    .clicked()
-                {
-                    (self.on_track_record)(*track_id);
-                }
-                ui.add_space(8.0);
-            });
-
-            // Sample controls (indented)
-            for (
-                sample_id,
-                sample_name,
-                position,
-                length,
-                current_position,
-                duration,
-                trim_start,
-                trim_end,
-            ) in samples
-            {
-                ui.horizontal(|ui| {
-                    ui.add_space(20.0); // Indent
-                    ui.label(RichText::new(format!("Sample: {}", sample_name)).size(12.0));
-
-                    ui.add_space(8.0);
-                    ui.label(RichText::new("Start:").size(12.0));
-                    let mut pos = *position;
-                    ui.add(egui::DragValue::new(&mut pos).speed(0.1));
-                    if pos != *position {
-                        (self.on_sample_start_change)(*track_id, *sample_id, pos);
-                    }
-
-                    ui.add_space(8.0);
-                    ui.label(RichText::new("Length:").size(12.0));
-                    let mut len = *length;
-                    ui.add(
-                        egui::DragValue::new(&mut len)
-                            .speed(0.1)
-                            .clamp_range(0.1..=100.0),
-                    );
-                    if len != *length {
-                        (self.on_sample_length_change)(*track_id, *sample_id, len);
-                    }
-
-                    if *duration > 0.0 {
-                        ui.label(
-                            RichText::new(format!("{:.1}s / {:.1}s", current_position, duration))
-                                .size(12.0),
-                        );
-                    }
-                });
-
-                // Add trim controls in a separate row
-                ui.horizontal(|ui| {
-                    ui.add_space(30.0); // More indent
-                    ui.label(RichText::new("Trim Start:").size(12.0));
-                    let mut start = *trim_start;
-                    ui.add(
-                        egui::DragValue::new(&mut start)
-                            .speed(0.1)
-                            .suffix(" s")
-                            .range(0.0..=*duration),
-                    );
-
-                    ui.add_space(8.0);
-                    ui.label(RichText::new("Trim End:").size(12.0));
-                    let mut end = if *trim_end <= 0.0 {
-                        *duration
-                    } else {
-                        *trim_end
-                    };
-                    ui.add(
-                        egui::DragValue::new(&mut end)
-                            .speed(0.1)
-                            .suffix(" s")
-                            .clamp_range(start..=*duration),
-                    );
-
-                    // Only trigger the callback if values actually changed
-                    if start != *trim_start
-                        || end
-                            != (if *trim_end <= 0.0 {
-                                *duration
-                            } else {
-                                *trim_end
-                            })
-                    {
-                        (self.on_sample_trim_change)(*track_id, *sample_id, start, end);
-                    }
-                });
-            }
-
-            ui.add_space(4.0);
-            ui.separator();
-        }
-    }
-}
 
 struct TabsBar<'a> {
     tabs: Vec<(usize, String, bool, bool)>, // id, name, is_active, is_group
@@ -706,6 +560,7 @@ impl eframe::App for DawApp {
             LoadProject,
             RenderSelection,
             SetTimelinePosition(f32),
+            SetLastClickedPosition(f32),
             TrackDrag {
                 track_id: usize,
                 sample_id: usize,
@@ -1048,8 +903,21 @@ impl eframe::App for DawApp {
 
                 // Grid in the middle
                 let actions_clone = actions.clone();
+                
+                // Get the last clicked track index and position from the previous frame if it exists
+                let previous_clicked_track = ctx.memory(|mem| 
+                    mem.data.get_temp::<Option<usize>>(egui::Id::new("grid_clicked_track"))
+                        .unwrap_or(None)
+                );
+                
+                let previous_clicked_position = ctx.memory(|mem| 
+                    mem.data.get_temp::<Option<f32>>(egui::Id::new("grid_clicked_position"))
+                        .unwrap_or(None)
+                ).unwrap_or(self.state.timeline_position);
+                
                 let mut grid = Grid {
                     timeline_position: self.state.timeline_position,
+                    clicked_position: self.state.last_clicked_position, // Use the dedicated field from state
                     bpm: self.state.bpm,
                     grid_division: self.state.grid_division,
                     tracks: track_info,
@@ -1102,6 +970,11 @@ impl eframe::App for DawApp {
                             .borrow_mut()
                             .push(UiAction::SetTimelinePosition(position));
                     },
+                    on_clicked_position_change: &mut |position| {
+                        actions_clone
+                            .borrow_mut()
+                            .push(UiAction::SetLastClickedPosition(position));
+                    },
                     loop_enabled: self.state.loop_enabled,
                     loop_range: self.state.loop_range,
                     on_group_double_click: &mut |track_id, group_id, group_name| {
@@ -1117,8 +990,16 @@ impl eframe::App for DawApp {
                             .borrow_mut()
                             .push(UiAction::SetZoomLevel(zoom_level));
                     },
+                    is_playing: self.state.is_playing,
+                    clicked_track_idx: previous_clicked_track,
                 };
                 grid.draw(ui);
+
+                // Store clicked track and position for the next frame
+                ctx.memory_mut(|mem| {
+                    mem.data.insert_temp(egui::Id::new("grid_clicked_track"), grid.clicked_track_idx);
+                    mem.data.insert_temp(egui::Id::new("grid_clicked_position"), grid.clicked_position);
+                });
 
                 // Check if scroll position changed and update
                 if grid.h_scroll_offset != self.state.h_scroll_offset
@@ -1130,85 +1011,6 @@ impl eframe::App for DawApp {
                             h_scroll: grid.h_scroll_offset,
                             v_scroll: grid.v_scroll_offset,
                         });
-                }
-
-                // Track controls
-                ui.add_space(8.0);
-                ui.separator();
-                ui.add_space(8.0);
-                let actions_clone = actions.clone();
-                TrackControls {
-                    tracks: track_controls_info,
-                    on_sample_start_change: &mut |track_id, sample_id, position| {
-                        actions_clone
-                            .borrow_mut()
-                            .push(UiAction::SetSamplePosition {
-                                track_id,
-                                sample_id,
-                                position,
-                            });
-                    },
-                    on_sample_length_change: &mut |track_id, sample_id, length| {
-                        actions_clone.borrow_mut().push(UiAction::SetSampleLength {
-                            track_id,
-                            sample_id,
-                            length,
-                        });
-                    },
-                    on_track_file_select: &mut |track_id| {
-                        actions_clone
-                            .borrow_mut()
-                            .push(UiAction::LoadTrackAudio(track_id));
-                    },
-                    on_track_mute: &mut |track_id| {
-                        actions_clone
-                            .borrow_mut()
-                            .push(UiAction::ToggleTrackMute(track_id));
-                    },
-                    on_track_solo: &mut |track_id| {
-                        actions_clone
-                            .borrow_mut()
-                            .push(UiAction::ToggleTrackSolo(track_id));
-                    },
-                    on_track_record: &mut |track_id| {
-                        actions_clone
-                            .borrow_mut()
-                            .push(UiAction::ToggleTrackRecord(track_id));
-                    },
-                    on_sample_trim_change: &mut |track_id, sample_id, trim_start, trim_end| {
-                        actions_clone.borrow_mut().push(UiAction::SetSampleTrim {
-                            track_id,
-                            sample_id,
-                            trim_start,
-                            trim_end,
-                        });
-                    },
-                }
-                .draw(ui);
-
-                // Add a button to save the audio box when it's open in a tab
-                if is_group_tab {
-                    if let Some(box_name) = &group_name {
-                        ui.horizontal(|ui| {
-                            ui.add_space(8.0);
-                            
-                            ui.label(RichText::new("Audio Box:").size(16.0).strong());
-                            ui.label(RichText::new(box_name).size(16.0));
-                            
-                            ui.add_space(ui.available_width() - 120.0);
-                            
-                            if ui.button(RichText::new("💾 Save Group").size(14.0))
-                                .on_hover_text("Save Group and update render.wav")
-                                .clicked() 
-                            {
-                                actions_clone.borrow_mut().push(UiAction::SaveGroup(box_name.clone()));
-                            }
-                        });
-                        
-                        ui.add_space(4.0);
-                        ui.separator();
-                        ui.add_space(4.0);
-                    }
                 }
             });
         });
@@ -1430,6 +1232,10 @@ impl eframe::App for DawApp {
                 }
                 UiAction::SaveGroup(box_name) => {
                     self.dispatch(DawAction::SaveGroup(box_name.clone()));
+                }
+                UiAction::SetLastClickedPosition(position) => {
+                    // Use the new DawAction that only updates the clicked position
+                    self.dispatch(DawAction::SetClickedPosition(*position));
                 }
             }
         }

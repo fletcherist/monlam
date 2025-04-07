@@ -1,8 +1,8 @@
 use crate::daw::SelectionRect;
 use crate::ui::main::{
     BAR_LINE_COLOR, BASE_PIXELS_PER_BEAT, BEAT_LINE_COLOR, GRID_BACKGROUND, PLAYHEAD_COLOR,
-     SCROLLBAR_SIZE, TRACK_BORDER_COLOR, TRACK_HEIGHT, TRACK_SPACING,
-    TRACK_TEXT_COLOR,
+    SAMPLE_BORDER_COLOR, SCROLLBAR_SIZE, SELECTION_COLOR, TRACK_BORDER_COLOR, TRACK_HEIGHT,
+    TRACK_SPACING, TRACK_TEXT_COLOR, WAVEFORM_COLOR,
 };
 use crate::ui::grid_item::{GridItem, GridItemDragging, GridItemHelper};
 use crate::daw::TrackItemType;
@@ -10,6 +10,7 @@ use egui::{Color32, Stroke};
 
 pub struct Grid<'a> {
     pub timeline_position: f32,
+    pub clicked_position: f32,   // New field to store the position where user clicked
     pub bpm: f32,
     pub grid_division: f32,
     pub tracks: Vec<(
@@ -31,6 +32,7 @@ pub struct Grid<'a> {
     pub selection: Option<SelectionRect>,
     pub on_selection_change: &'a mut dyn FnMut(Option<SelectionRect>),
     pub on_playhead_position_change: &'a mut dyn FnMut(f32), // Callback when playhead position changes
+    pub on_clicked_position_change: &'a mut dyn FnMut(f32),  // Callback when the blue marker position changes
     pub loop_enabled: bool,
     pub loop_range: Option<(f32, f32)>, // Loop start and end times in seconds
     pub on_group_double_click: &'a mut dyn FnMut(usize, usize, &str), // Callback when a group is double-clicked
@@ -38,6 +40,8 @@ pub struct Grid<'a> {
     pub seconds_per_pixel: f32,
     pub zoom_level: f32,                     // Zoom level for the grid view (1.0 = 100%)
     pub on_zoom_change: &'a mut dyn FnMut(f32),
+    pub is_playing: bool,                    // Whether the DAW is currently playing
+    pub clicked_track_idx: Option<usize>,    // The index of the track that was clicked (for track-only playhead)
 }
 
 /// Trait for handling grid selection operations
@@ -148,17 +152,20 @@ impl<'a> Grid<'a> {
         let mut clicked_on_sample_in_track = false;
 
         let available_width = ui.available_width();
-        let available_height = ui.available_height().min(500.0); // Limit max height
+        let available_height = ui.available_height(); // Remove the height limitation
 
-        // Calculate grid height based on number of tracks
-        let total_grid_height = TRACK_HEIGHT * self.tracks.len() as f32
+        // Calculate minimum grid height based on number of tracks
+        let min_grid_height = TRACK_HEIGHT * self.tracks.len() as f32
             + TRACK_SPACING * (self.tracks.len() as f32 - 1.0);
+            
+        // Always use full available height, but ensure it's at least as big as needed for tracks
+        let total_grid_height = min_grid_height.max(available_height);
 
         // Capture tracks.len() for use in closures
         let tracks_len = self.tracks.len();
 
-        // Determine if scrollbars are needed
-        let need_v_scroll = total_grid_height > available_height;
+        // Determine if scrollbars are needed - vertical scroll only if min_grid_height > available_height
+        let need_v_scroll = min_grid_height > available_height;
         let actual_width = if need_v_scroll {
             available_width - SCROLLBAR_SIZE
         } else {
@@ -426,15 +433,20 @@ impl<'a> Grid<'a> {
         let screen_y_to_track_index = move |screen_y: f32| -> Option<usize> {
             let y_relative_to_grid = screen_y - grid_rect.top();
             if y_relative_to_grid < 0.0 {
+                eprintln!("Clicked above the grid: y_relative={}", y_relative_to_grid);
                 return None; // Clicked above the grid
             }
             let scrolled_y = v_scroll_offset + y_relative_to_grid;
             let track_index_f = scrolled_y / (TRACK_HEIGHT + TRACK_SPACING);
             let track_index = track_index_f.floor() as usize;
 
+            eprintln!("Track index calculation: y_relative={}, scrolled_y={}, track_index_f={}, track_index={}, tracks_len={}", 
+                      y_relative_to_grid, scrolled_y, track_index_f, track_index, tracks_len);
+
             if track_index < tracks_len {
                 Some(track_index)
             } else {
+                eprintln!("Clicked below the last track: track_index={}, tracks_len={}", track_index, tracks_len);
                 None // Clicked below the last track
             }
         };
@@ -469,7 +481,7 @@ impl<'a> Grid<'a> {
             // Constrain vertical scroll
             v_scroll_offset = v_scroll_offset
                 .max(0.0)
-                .min((total_grid_height - visible_height).max(0.0));
+                .min((min_grid_height - visible_height).max(0.0));
         }
 
         let painter = ui.painter_at(grid_rect);
@@ -575,6 +587,22 @@ impl<'a> Grid<'a> {
             // Draw track controls on the right side
             let control_top = track_top + 30.0; // Move control buttons down to make room for title
             let control_left = grid_rect.left() + track_area_width;
+            
+            // Draw control panel background - an opaque rectangle for the entire track height
+            let control_panel_rect = egui::Rect::from_min_max(
+                egui::Pos2::new(control_left, track_top),
+                egui::Pos2::new(grid_rect.right(), track_bottom),
+            );
+            painter.rect_filled(control_panel_rect, 0.0, Color32::from_rgb(45, 45, 50));
+            
+            // Add a left border to visually separate the control panel from the grid
+            painter.line_segment(
+                [
+                    egui::Pos2::new(control_left, track_top),
+                    egui::Pos2::new(control_left, track_bottom),
+                ],
+                Stroke::new(1.0, Color32::from_rgb(70, 70, 75)),
+            );
 
             // Display track name on the right side, above the buttons
             painter.text(
@@ -847,9 +875,21 @@ impl<'a> Grid<'a> {
                     // Convert the snapped beat position back to seconds
                     let snapped_seconds_position = snapped_beat_position / beats_per_second;
 
-                    // Update timeline position and notify through callback
+                    // Store the clicked track if any
+                    let clicked_track = screen_y_to_track_index(pointer_pos.y);
+                    
+                    // Only update the clicked position and track when manually clicking, not during playback callbacks
+                    self.clicked_track_idx = clicked_track;
+                    self.clicked_position = snapped_seconds_position;
+                    
+                    // Debug the clicked track
+                    eprintln!("Clicked at y={}, track_idx={:?}, position={}s (clicked_pos={}s)", 
+                              pointer_pos.y, clicked_track, snapped_seconds_position, self.clicked_position);
+
+                    // Update both the clicked position and timeline position, but use SEPARATE callbacks
                     self.timeline_position = snapped_seconds_position;
                     (self.on_playhead_position_change)(snapped_seconds_position);
+                    (self.on_clicked_position_change)(snapped_seconds_position);
                 }
             }
         }
@@ -881,40 +921,68 @@ impl<'a> Grid<'a> {
             );
 
             // Choose colors based on whether looping is enabled
-            let (fill_color, stroke_color) = if self.loop_enabled {
+            let fill_color = if self.loop_enabled {
                 // Brighter colors for loop-enabled state
-                (
-                    Color32::from_rgba_premultiplied(255, 100, 100, 80), // Red-tinted, more visible
-                    Color32::from_rgb(255, 100, 100),                    // Red border
-                )
+                Color32::from_rgba_premultiplied(255, 100, 100, 80) // Red-tinted, more visible
             } else {
-                // Default colors for normal selection
-                (
-                    Color32::from_rgba_premultiplied(100, 150, 255, 64), // Light blue, semi-transparent
-                    Color32::from_rgb(100, 150, 255),                    // Light blue border
-                )
+                // Default colors for normal selection - use the SELECTION_COLOR
+                SELECTION_COLOR.linear_multiply(0.3)  // Blue with transparency
             };
 
             // Draw semi-transparent fill
             painter.rect_filled(selection_rect, 0.0, fill_color);
-
-            // Draw border
-            painter.rect_stroke(selection_rect, 0.0, Stroke::new(2.0, stroke_color), egui::StrokeKind::Inside);
         }
 
         // Draw playhead adjusted for horizontal scroll
         let visible_playhead_x =
             grid_rect.left() + (self.timeline_position - h_scroll_offset) / seconds_per_pixel;
 
-        // Only draw playhead if it's in the visible area
-        if visible_playhead_x >= grid_rect.left() && visible_playhead_x <= grid_rect.right() {
+        // Only draw the playhead if it's in the visible area AND
+        // either the audio is playing OR there's no blue marker visible
+        if visible_playhead_x >= grid_rect.left() && visible_playhead_x <= grid_rect.right() &&
+           (self.is_playing || self.clicked_track_idx.is_none()) {
             painter.line_segment(
                 [
                     egui::Pos2::new(visible_playhead_x, grid_rect.top()),
                     egui::Pos2::new(visible_playhead_x, grid_rect.bottom()),
                 ],
-                Stroke::new(2.0, PLAYHEAD_COLOR),
+                Stroke::new(0.75, PLAYHEAD_COLOR), // Using the white playhead color
             );
+        }
+
+        // Draw BLUE marker for selected track
+        // This stays in place at all times, regardless of playback state
+        if let Some(track_idx) = self.clicked_track_idx {
+            // Calculate the x position of the blue marker based on the stored clicked position
+            let clicked_x_pos = grid_rect.left() + (self.clicked_position - h_scroll_offset) / seconds_per_pixel;
+            
+            // Debug the positions to help diagnose issues
+            eprintln!("Drawing BLUE marker: track={}, click_pos={}s, timeline_pos={}s, clicked_x={}, playhead_x={}", 
+                      track_idx, self.clicked_position, self.timeline_position, clicked_x_pos, visible_playhead_x);
+            
+            // Only draw if it's in the visible area
+            if clicked_x_pos >= grid_rect.left() && clicked_x_pos <= grid_rect.right() {
+                let track_top = grid_rect.top() + track_idx as f32 * (TRACK_HEIGHT + TRACK_SPACING)
+                    - v_scroll_offset;
+                let track_bottom = track_top + TRACK_HEIGHT;
+                
+                // Only draw if the track is visible
+                if track_bottom >= grid_rect.top() && track_top <= grid_rect.bottom() {
+                    let visible_top = track_top.max(grid_rect.top());
+                    let visible_bottom = track_bottom.min(grid_rect.bottom());
+                    
+                    // Offset by 1 pixel to separate
+                    let track_marker_x = clicked_x_pos + 1.0;
+                    
+                    painter.line_segment(
+                        [
+                            egui::Pos2::new(track_marker_x, visible_top - 3.0), 
+                            egui::Pos2::new(track_marker_x, visible_bottom + 3.0),
+                        ],
+                        Stroke::new(1.0, SELECTION_COLOR), // Using blue selection color
+                    );
+                }
+            }
         }
 
         // Handle keyboard events for deleting selected samples
@@ -959,6 +1027,47 @@ impl<'a> Grid<'a> {
                             }
                         }
                     }
+                }
+            }
+            
+            // Handle arrow keys to move the blue marker position
+            if self.clicked_track_idx.is_some() {
+                // Get current position in beats
+                let current_beat_pos = self.clicked_position * (self.bpm / 60.0);
+                
+                // Check for left/right arrow keys
+                if ui.input(|i| i.key_pressed(egui::Key::ArrowLeft)) {
+                    // Move backward by one grid division
+                    let new_beat_pos = current_beat_pos - self.grid_division;
+                    // Ensure we don't go below zero
+                    let new_beat_pos = new_beat_pos.max(0.0);
+                    // Snap to grid
+                    let snapped_beat_pos = snap_to_grid(new_beat_pos);
+                    // Convert back to seconds
+                    let new_position = snapped_beat_pos / (self.bpm / 60.0);
+                    
+                    // Update the clicked position
+                    self.clicked_position = new_position;
+                    // Update the callback
+                    (self.on_clicked_position_change)(new_position);
+                    
+                    eprintln!("Moved marker left to {}s ({})", new_position, snapped_beat_pos);
+                }
+                
+                if ui.input(|i| i.key_pressed(egui::Key::ArrowRight)) {
+                    // Move forward by one grid division
+                    let new_beat_pos = current_beat_pos + self.grid_division;
+                    // Snap to grid
+                    let snapped_beat_pos = snap_to_grid(new_beat_pos);
+                    // Convert back to seconds
+                    let new_position = snapped_beat_pos / (self.bpm / 60.0);
+                    
+                    // Update the clicked position
+                    self.clicked_position = new_position;
+                    // Update the callback
+                    (self.on_clicked_position_change)(new_position);
+                    
+                    eprintln!("Moved marker right to {}s ({})", new_position, snapped_beat_pos);
                 }
             }
         }
@@ -1028,9 +1137,9 @@ impl<'a> Grid<'a> {
             painter.rect_filled(v_scrollbar_rect, 0.0, Color32::from_rgb(40, 40, 40));
 
             // Calculate thumb size and position
-            let v_visible_ratio = visible_height / total_grid_height;
+            let v_visible_ratio = visible_height / min_grid_height;
             let v_thumb_height = v_visible_ratio * v_scrollbar_rect.height();
-            let v_scroll_ratio = v_scroll_offset / (total_grid_height - visible_height).max(0.001);
+            let v_scroll_ratio = v_scroll_offset / (min_grid_height - visible_height).max(0.001);
             let v_thumb_top = v_scrollbar_rect.top()
                 + v_scroll_ratio * (v_scrollbar_rect.height() - v_thumb_height);
 
@@ -1049,10 +1158,10 @@ impl<'a> Grid<'a> {
                     .unwrap_or_default();
                 let click_pos_ratio =
                     (mouse_pos.y - v_scrollbar_rect.top()) / v_scrollbar_rect.height();
-                v_scroll_offset = click_pos_ratio * (total_grid_height - visible_height);
+                v_scroll_offset = click_pos_ratio * (min_grid_height - visible_height);
                 v_scroll_offset = v_scroll_offset
                     .max(0.0)
-                    .min((total_grid_height - visible_height).max(0.0));
+                    .min((min_grid_height - visible_height).max(0.0));
             }
         }
 
@@ -1064,7 +1173,7 @@ impl<'a> Grid<'a> {
                 v_scroll_offset += scroll_delta.y * -0.5; // Adjust sensitivity
                 v_scroll_offset = v_scroll_offset
                     .max(0.0)
-                    .min((total_grid_height - visible_height).max(0.0));
+                    .min((min_grid_height - visible_height).max(0.0));
             }
 
             // Horizontal scrolling with shift+wheel or horizontal wheel
