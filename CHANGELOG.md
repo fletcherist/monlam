@@ -23,7 +23,7 @@
 
 2025-04-07
 [x] - drag & drop improvements
-
+[x] - feat: better loop range, selected bar arrow navigation
 
 [] - store waveforms not in .monlam folder but in project folder in .monlam folder
 [] - investigate why .mp3 files loading took so long

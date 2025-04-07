@@ -34,7 +34,9 @@ pub struct Grid<'a> {
     pub on_playhead_position_change: &'a mut dyn FnMut(f32), // Callback when playhead position changes
     pub on_clicked_position_change: &'a mut dyn FnMut(f32),  // Callback when the blue marker position changes
     pub loop_enabled: bool,
-    pub loop_range: Option<(f32, f32)>, // Loop start and end times in seconds
+    pub loop_start: f32,         // Loop start time in beats
+    pub loop_end: f32,           // Loop end time in beats
+    pub on_loop_change: &'a mut dyn FnMut(bool, f32, f32),  // Callback when loop range changes (enabled, start, end)
     pub on_group_double_click: &'a mut dyn FnMut(usize, usize, &str), // Callback when a group is double-clicked
     pub snap_to_grid_enabled: bool,
     pub seconds_per_pixel: f32,
@@ -206,8 +208,8 @@ impl<'a> Grid<'a> {
         // Draw loop range control at the top of the grid
         let loop_height = 16.0; // Small height for the loop range control
         let loop_enabled = self.loop_enabled;
-        let loop_start = self.selection.as_ref().map_or(0.0, |s| s.start_beat);
-        let loop_end = self.selection.as_ref().map_or(16.0, |s| s.end_beat);
+        let loop_start = self.loop_start;
+        let loop_end = self.loop_end;
 
         // Allocate space for the loop control
         let (loop_rect, loop_response) = ui.allocate_exact_size(
@@ -258,74 +260,69 @@ impl<'a> Grid<'a> {
                 }
             }
 
-            // Draw loop range if selection exists
-            if self.selection.is_some() {
-                let start_x = beat_to_screen_x(loop_start);
-                let end_x = beat_to_screen_x(loop_end);
+            // Draw loop range - always draw it, not depending on selection
+            let start_x = beat_to_screen_x(loop_start);
+            let end_x = beat_to_screen_x(loop_end);
 
-                // Only draw if at least partially visible
-                if end_x >= loop_rect.left() && start_x <= loop_rect.right() {
-                    let visible_start_x = start_x.max(loop_rect.left());
-                    let visible_end_x = end_x.min(loop_rect.right());
+            // Only draw if at least partially visible
+            if end_x >= loop_rect.left() && start_x <= loop_rect.right() {
+                let visible_start_x = start_x.max(loop_rect.left());
+                let visible_end_x = end_x.min(loop_rect.right());
 
-                    let loop_range_rect = egui::Rect::from_min_max(
-                        egui::pos2(visible_start_x, loop_rect.top()),
-                        egui::pos2(visible_end_x, loop_rect.bottom()),
-                    );
+                let loop_range_rect = egui::Rect::from_min_max(
+                    egui::pos2(visible_start_x, loop_rect.top()),
+                    egui::pos2(visible_end_x, loop_rect.bottom()),
+                );
 
-                    // Draw loop range background
-                    painter.rect_filled(
-                        loop_range_rect,
-                        0.0,
+                // Draw loop range background
+                painter.rect_filled(
+                    loop_range_rect,
+                    0.0,
+                    if loop_enabled {
+                        Color32::from_rgba_premultiplied(255, 50, 50, 80)
+                    } else {
+                        Color32::from_rgba_premultiplied(100, 100, 100, 80)
+                    },
+                );
+
+                // Draw loop range borders
+                painter.rect_stroke(
+                    loop_range_rect,
+                    0.0,
+                    Stroke::new(
+                        1.0,
                         if loop_enabled {
-                            Color32::from_rgba_premultiplied(255, 50, 50, 80)
+                            Color32::from_rgb(255, 50, 50)
                         } else {
-                            Color32::from_rgba_premultiplied(100, 100, 100, 80)
+                            Color32::from_rgb(150, 150, 150)
                         },
+                    ),
+                    egui::StrokeKind::Inside,
+                );
+
+                // Draw start and end handles if visible
+                if start_x >= loop_rect.left() && start_x <= loop_rect.right() {
+                    let handle_width = 4.0;
+                    let start_handle = egui::Rect::from_min_max(
+                        egui::pos2(start_x - handle_width / 2.0, loop_rect.top()),
+                        egui::pos2(start_x + handle_width / 2.0, loop_rect.bottom()),
                     );
+                    painter.rect_filled(start_handle, 0.0, Color32::from_rgb(200, 200, 200));
+                }
 
-                    // Draw loop range borders
-                    painter.rect_stroke(
-                        loop_range_rect,
-                        0.0,
-                        Stroke::new(
-                            1.0,
-                            if loop_enabled {
-                                Color32::from_rgb(255, 50, 50)
-                            } else {
-                                Color32::from_rgb(150, 150, 150)
-                            },
-                        ),
-                        egui::StrokeKind::Inside,
+                if end_x >= loop_rect.left() && end_x <= loop_rect.right() {
+                    let handle_width = 4.0;
+                    let end_handle = egui::Rect::from_min_max(
+                        egui::pos2(end_x - handle_width / 2.0, loop_rect.top()),
+                        egui::pos2(end_x + handle_width / 2.0, loop_rect.bottom()),
                     );
-
-                    // Draw start and end handles if visible
-                    if start_x >= loop_rect.left() && start_x <= loop_rect.right() {
-                        let handle_width = 4.0;
-                        let start_handle = egui::Rect::from_min_max(
-                            egui::pos2(start_x - handle_width / 2.0, loop_rect.top()),
-                            egui::pos2(start_x + handle_width / 2.0, loop_rect.bottom()),
-                        );
-                        painter.rect_filled(start_handle, 0.0, Color32::from_rgb(200, 200, 200));
-                    }
-
-                    if end_x >= loop_rect.left() && end_x <= loop_rect.right() {
-                        let handle_width = 4.0;
-                        let end_handle = egui::Rect::from_min_max(
-                            egui::pos2(end_x - handle_width / 2.0, loop_rect.top()),
-                            egui::pos2(end_x + handle_width / 2.0, loop_rect.bottom()),
-                        );
-                        painter.rect_filled(end_handle, 0.0, Color32::from_rgb(200, 200, 200));
-                    }
+                    painter.rect_filled(end_handle, 0.0, Color32::from_rgb(200, 200, 200));
                 }
             }
         }
 
         // Handle loop range interaction
-        if loop_response.dragged()
-            && self.selection.is_some()
-            && loop_response.interact_pointer_pos().is_some()
-        {
+        if loop_response.dragged() && loop_response.interact_pointer_pos().is_some() {
             let mouse_pos = loop_response.interact_pointer_pos().unwrap();
 
             // Convert screen position to beat
@@ -350,12 +347,9 @@ impl<'a> Grid<'a> {
                 upper_grid_line
             };
 
-            // Determine what we're dragging
-            let mut selection = self.selection.clone().unwrap();
-
             // Calculate the start_x and end_x using the same formula as the beat_to_screen_x closure
-            let start_seconds = selection.start_beat / beats_per_second;
-            let end_seconds = selection.end_beat / beats_per_second;
+            let start_seconds = self.loop_start / beats_per_second;
+            let end_seconds = self.loop_end / beats_per_second;
             let start_x =
                 loop_rect.left() + ((start_seconds - h_scroll_offset) / seconds_per_pixel);
             let end_x = loop_rect.left() + ((end_seconds - h_scroll_offset) / seconds_per_pixel);
@@ -365,27 +359,29 @@ impl<'a> Grid<'a> {
                 || (loop_response.drag_started() && mouse_pos.x < (start_x + end_x) / 2.0 - 10.0)
             {
                 // Drag start handle
-                selection.start_beat = snapped_beat_pos.max(0.0).min(selection.end_beat - 0.5);
-                (self.on_selection_change)(Some(selection));
+                let new_loop_start = snapped_beat_pos.max(0.0).min(self.loop_end - 0.5);
+                self.loop_start = new_loop_start;
+                (self.on_loop_change)(self.loop_enabled, new_loop_start, self.loop_end);
             }
             // Check if we're near the end handle
             else if (mouse_pos.x - end_x).abs() < 10.0
                 || (loop_response.drag_started() && mouse_pos.x > (start_x + end_x) / 2.0 + 10.0)
             {
                 // Drag end handle
-                selection.end_beat = snapped_beat_pos.max(selection.start_beat + 0.5);
-                (self.on_selection_change)(Some(selection));
+                let new_loop_end = snapped_beat_pos.max(self.loop_start + 0.5);
+                self.loop_end = new_loop_end;
+                (self.on_loop_change)(self.loop_enabled, self.loop_start, new_loop_end);
             }
             // If not dragging handles, move the entire range
             else {
                 // Calculate the range width
-                let range_width = selection.end_beat - selection.start_beat;
+                let range_width = self.loop_end - self.loop_start;
 
                 // Get the drag delta in beats since last frame
                 let drag_delta = loop_response.drag_delta().x / (pixels_per_beat);
 
                 // Apply drag - move both start and end points together
-                let new_start = (selection.start_beat + drag_delta).max(0.0);
+                let new_start = (self.loop_start + drag_delta).max(0.0);
 
                 // Snap the start position to grid
                 let division = self.grid_division;
@@ -401,11 +397,21 @@ impl<'a> Grid<'a> {
                 };
 
                 // Ensure we maintain the same width
-                selection.start_beat = snapped_start;
-                selection.end_beat = snapped_start + range_width;
-
-                (self.on_selection_change)(Some(selection));
+                let new_loop_start = snapped_start;
+                let new_loop_end = snapped_start + range_width;
+                
+                self.loop_start = new_loop_start;
+                self.loop_end = new_loop_end;
+                (self.on_loop_change)(self.loop_enabled, new_loop_start, new_loop_end);
             }
+        }
+        
+        // Handle double-click to toggle loop enabled state
+        if loop_response.double_clicked() {
+            // Toggle the loop enabled state
+            self.loop_enabled = !self.loop_enabled;
+            // Call the callback to notify about the change
+            (self.on_loop_change)(self.loop_enabled, self.loop_start, self.loop_end);
         }
 
         // Allocate the grid area
@@ -509,17 +515,6 @@ impl<'a> Grid<'a> {
                 ],
                 Stroke::new(1.0, color),
             );
-
-            // Draw beat number for every bar (4 beats)
-            if beat % 4 == 0 {
-                painter.text(
-                    egui::Pos2::new(x + 4.0, grid_rect.top() + 12.0),
-                    egui::Align2::LEFT_TOP,
-                    format!("{}", beat / 4 + 1),
-                    egui::FontId::proportional(10.0),
-                    Color32::from_rgb(150, 150, 150),
-                );
-            }
 
             // Draw subdivision grid lines with 0.5 opacity for better snapping visualization
             let subdivisions = (1.0 / self.grid_division).floor() as i32;
@@ -955,10 +950,6 @@ impl<'a> Grid<'a> {
         if let Some(track_idx) = self.clicked_track_idx {
             // Calculate the x position of the blue marker based on the stored clicked position
             let clicked_x_pos = grid_rect.left() + (self.clicked_position - h_scroll_offset) / seconds_per_pixel;
-            
-            // Debug the positions to help diagnose issues
-            eprintln!("Drawing BLUE marker: track={}, click_pos={}s, timeline_pos={}s, clicked_x={}, playhead_x={}", 
-                      track_idx, self.clicked_position, self.timeline_position, clicked_x_pos, visible_playhead_x);
             
             // Only draw if it's in the visible area
             if clicked_x_pos >= grid_rect.left() && clicked_x_pos <= grid_rect.right() {

@@ -84,7 +84,7 @@ impl<'a> TransportControls<'a> {
                 ui.add(egui::Button::new(
                     loop_text.color(Color32::from_rgb(100, 100, 100)),
                 ))
-                .on_hover_text("Click to enable loop mode (requires selection)")
+                .on_hover_text("Click to enable loop mode")
             };
 
             if loop_button.clicked() {
@@ -96,7 +96,10 @@ impl<'a> TransportControls<'a> {
             // BPM control
             ui.label(RichText::new("BPM:").size(14.0));
             let mut bpm = self.bpm;
-            ui.add(egui::Slider::new(&mut bpm, 30.0..=240.0).step_by(1.0));
+            ui.add(egui::DragValue::new(&mut bpm)
+                .range(30.0..=240.0)
+                .speed(1.0)
+                .fixed_decimals(2));
             if bpm != self.bpm {
                 (self.on_bpm_change)(bpm);
             }
@@ -240,18 +243,19 @@ impl eframe::App for DawApp {
 
         // Handle Cmd+L to toggle loop with current selection
         if ctx.input(|i| i.key_pressed(Key::L) && i.modifiers.command) {
-            // Only enable looping if there's a selection
+            // If there's a selection, set loop range from it
             if self.state.selection.is_some() {
-                // First set the loop range from the selection
+                // Set the loop range from the selection
                 self.dispatch(DawAction::SetLoopRangeFromSelection);
-                // Then toggle the loop state
-                self.dispatch(DawAction::ToggleLoopSelection);
+            }
+            
+            // Toggle the loop state regardless of selection
+            self.dispatch(DawAction::ToggleLoopSelection);
 
-                // If we're enabling looping and playback is active, set the timeline position to the start of the selection
-                if self.state.loop_enabled && self.state.is_playing {
-                    let selection = self.state.selection.as_ref().unwrap();
-                    let loop_start = selection.start_beat * (60.0 / self.state.bpm);
-                    self.dispatch(DawAction::SetTimelinePosition(loop_start));
+            // If we're enabling looping and playback is active, set the timeline position to the start of the loop
+            if self.state.loop_enabled && self.state.is_playing {
+                if let Some(loop_range) = self.state.loop_range {
+                    self.dispatch(DawAction::SetTimelinePosition(loop_range.0));
                 }
             }
         }
@@ -614,6 +618,7 @@ impl eframe::App for DawApp {
             SwitchToTab(usize),
             CloseTab(usize),
             SaveGroup(String),
+            UpdateLoopRange(bool, f32, f32),
         }
 
         // Add the top toolbar with transport controls
@@ -976,7 +981,16 @@ impl eframe::App for DawApp {
                             .push(UiAction::SetLastClickedPosition(position));
                     },
                     loop_enabled: self.state.loop_enabled,
-                    loop_range: self.state.loop_range,
+                    loop_start: self.state.loop_range.map_or(0.0, |range| range.0 * 4.0), // Convert seconds to beats with fixed ratio
+                    loop_end: self.state.loop_range.map_or(16.0, |range| range.1 * 4.0), // Convert seconds to beats with fixed ratio
+                    on_loop_change: &mut |enabled, start, end| {
+                        // Convert from beats back to seconds with fixed ratio
+                        let start_seconds = start / 4.0;
+                        let end_seconds = end / 4.0;
+                        actions_clone
+                            .borrow_mut()
+                            .push(UiAction::UpdateLoopRange(enabled, start_seconds, end_seconds));
+                    },
                     on_group_double_click: &mut |track_id, group_id, group_name| {
                         actions_clone
                             .borrow_mut()
@@ -1176,18 +1190,13 @@ impl eframe::App for DawApp {
                     self.dispatch(DawAction::SetSelection(selection.clone()));
                 }
                 UiAction::ToggleLoopSelection => {
-                    // Only toggle loop if there's a selection
-                    if self.state.selection.is_some() {
-                        // First set the loop range from the selection
-                        self.dispatch(DawAction::SetLoopRangeFromSelection);
-                        // Then toggle the loop state
-                        self.dispatch(DawAction::ToggleLoopSelection);
-
-                        // If we're enabling looping and playback is active, set the timeline position to the start of the selection
-                        if self.state.loop_enabled && self.state.is_playing {
-                            let selection = self.state.selection.as_ref().unwrap();
-                            let loop_start = selection.start_beat * (60.0 / self.state.bpm);
-                            self.dispatch(DawAction::SetTimelinePosition(loop_start));
+                    // Toggle loop directly without requiring a selection
+                    self.dispatch(DawAction::ToggleLoopSelection);
+                    
+                    // If we're enabling looping and playback is active, set the timeline position to the start of the loop
+                    if self.state.loop_enabled && self.state.is_playing {
+                        if let Some(loop_range) = self.state.loop_range {
+                            self.dispatch(DawAction::SetTimelinePosition(loop_range.0));
                         }
                     }
                 }
@@ -1236,6 +1245,9 @@ impl eframe::App for DawApp {
                 UiAction::SetLastClickedPosition(position) => {
                     // Use the new DawAction that only updates the clicked position
                     self.dispatch(DawAction::SetClickedPosition(*position));
+                }
+                UiAction::UpdateLoopRange(enabled, start, end) => {
+                    self.dispatch(DawAction::UpdateLoopRange(*enabled, *start, *end));
                 }
             }
         }

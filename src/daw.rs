@@ -45,6 +45,7 @@ pub enum DawAction {
     UpdateScrollPosition(f32, f32),                    // h_scroll, v_scroll
     SetSelection(Option<SelectionRect>),               // Use Option<SelectionRect>
     ToggleLoopSelection,       // Toggle looping within the current selection
+    UpdateLoopRange(bool, f32, f32), // Update loop enabled, start time, end time in seconds
     RenderSelection(PathBuf),  // Path to save the rendered WAV file
     SetZoomLevel(f32),         // Set the zoom level for the grid
     SetLoopRangeFromSelection, // Set loop range from current selection without toggling loop state
@@ -1102,6 +1103,10 @@ impl DawApp {
                 // Convert current timeline position from time to beats at old BPM
                 let current_position_in_beats =
                     self.state.timeline_position * (self.state.bpm / 60.0);
+                    
+                // Also convert last clicked position from time to beats
+                let clicked_position_in_beats = 
+                    self.state.last_clicked_position * (self.state.bpm / 60.0);
 
                 // Also convert horizontal scroll offset from time to beats
                 let scroll_offset_in_beats = self.state.h_scroll_offset * (self.state.bpm / 60.0);
@@ -1116,6 +1121,9 @@ impl DawApp {
 
                 // Convert back to time at new BPM, maintaining the same beat position
                 self.state.timeline_position = current_position_in_beats * (60.0 / bpm);
+                
+                // Convert last clicked position back to time at new BPM
+                self.state.last_clicked_position = clicked_position_in_beats * (60.0 / bpm);
 
                 // Also convert scroll offset back to time at new BPM
                 self.state.h_scroll_offset = scroll_offset_in_beats * (60.0 / bpm);
@@ -1451,8 +1459,18 @@ impl DawApp {
             }
             DawAction::ToggleLoopSelection => {
                 self.state.loop_enabled = !self.state.loop_enabled;
-                // No longer set the loop range based on selection
-                // We use SetLoopRangeFromSelection for that
+                
+                // If enabling loop and no loop range is set, create a default loop range (0-16 beats)
+                if self.state.loop_enabled && self.state.loop_range.is_none() {
+                    // Default to first 4 bars (16 beats) at current BPM
+                    let start_time = 0.0;
+                    let end_time = 16.0 * 60.0 / self.state.bpm; // 16 beats in seconds
+                    self.state.loop_range = Some((start_time, end_time));
+                }
+            }
+            DawAction::UpdateLoopRange(enabled, start_time, end_time) => {
+                self.state.loop_enabled = enabled;
+                self.state.loop_range = Some((start_time, end_time));
             }
             DawAction::RenderSelection(path) => {
                 if let Some(selection) = &self.state.selection {
