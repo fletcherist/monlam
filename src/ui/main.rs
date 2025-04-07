@@ -432,17 +432,35 @@ impl eframe::App for DawApp {
         // Filter dragged files to only include audio files
         drag_drop::filter_dragged_audio_files(ctx);
         
-        // Check if any drag operation is active (internal or external)
+        // Check for dragged items and show overlay if needed
         let drag_active = drag_drop::is_drag_active(ctx);
-        
-        // Draw the drop overlay if needed
         drag_drop::draw_drop_overlay(ctx, drag_active);
+        
+        // Add a custom drag visualization for group dragging
+        if ctx.memory(|mem| mem.data.get_temp::<Group>(egui::Id::new("dragged_group")).is_some()) {
+            if let Some(pointer_pos) = ctx.pointer_hover_pos() {
+                // Large, very visible cursor that follows the mouse
+                egui::Area::new(egui::Id::new("global_group_drag_indicator"))
+                    .fixed_pos(pointer_pos)
+                    .order(egui::Order::Foreground)
+                    .show(ctx, |ui| {
+                        ui.add(egui::Label::new(
+                            egui::RichText::new("◉") // Large visible cursor
+                                .size(40.0)
+                                .color(egui::Color32::from_rgba_premultiplied(0, 120, 255, 150))
+                        ));
+                    });
+            }
+        }
         
         // Handle external file drops (from OS)
         drag_drop::handle_external_file_drop(self, ctx);
         
         // Handle internal file drops (from file browser)
         drag_drop::handle_internal_file_drop(self, ctx);
+        
+        // Get any pending actions back from the UI
+        let actions = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
 
         // Store state values locally to use in UI closures
         let is_playing = self.state.is_playing;
@@ -487,17 +505,17 @@ impl eframe::App for DawApp {
                                         // Generate waveform for display
                                         let waveform_data = generate_waveform(&audio_samples, 1000);
                                         
-                                        // Create a sample info entry representing the audio box
+                                        // Create a sample entry for the group
                                         let sample_info = (
                                             0usize, // sample id
                                             box_name.clone(),
-                                            0.0f32, // position
-                                            duration * (bpm / 60.0), // length in beats
-                                            waveform_data, 
-                                            rate,
-                                            duration,
-                                            0.0f32, // audio_start_time
-                                            duration, // audio_end_time
+                                            0.0f32, // grid position
+                                            4.0f32, // grid length (default to 4 beats)
+                                            waveform_data, // waveform data
+                                            rate as u32, // sample rate
+                                            duration, // full duration
+                                            0.0f32, // audio start time
+                                            0.0f32, // audio end time
                                             TrackItemType::Group,
                                         );
                                         
@@ -512,7 +530,7 @@ impl eframe::App for DawApp {
                 
                 // Add the track to our list
                 temp_tracks.push((
-                    track_id,
+                    track_id as usize,
                     track_name,
                     false, // muted
                     false, // soloed
@@ -731,6 +749,7 @@ impl eframe::App for DawApp {
             ToggleLoopSelection,
             SetLoopRangeFromSelection,
             SetZoomLevel(f32),
+            CreateTrack,
             CreateGroup(String),
             RenameGroup(String, String),
             DeleteGroup(String),
@@ -741,9 +760,6 @@ impl eframe::App for DawApp {
             CloseTab(usize),
             SaveGroup(String),
         }
-
-        // Collect actions during UI rendering using Rc<RefCell>
-        let actions = Rc::new(RefCell::new(Vec::new()));
 
         // Add the top toolbar with transport controls
         egui::TopBottomPanel::top("transport_controls").show(ctx, |ui| {
@@ -893,17 +909,91 @@ impl eframe::App for DawApp {
                     
                     // Handle group dragging - check if a group is being dragged
                     if let Some(dragged_group) = ctx.memory(|mem| mem.data.get_temp::<Group>(egui::Id::new("dragged_group"))) {
+                        eprintln!("DEBUG: Group drag detected in main loop: {} (size: {})", dragged_group.name, dragged_group.waveform.len());
+                        
+                        // Now we need to show a visual indicator that we have a dragged group
+                        if let Some(pointer_pos) = ctx.pointer_hover_pos() {
+                            // Show a simple indicator in the main loop too - this ensures visibility
+                            egui::Area::new(egui::Id::new("main_drag_indicator"))
+                                .fixed_pos(pointer_pos)
+                                .order(egui::Order::Foreground) // Make sure it's on top
+                                .show(ctx, |ui| {
+                                    ui.label(format!("Dragging: {}", dragged_group.name));
+                                });
+                        }
+                        
                         // If we detect a drop on the grid area
-                        for (track_idx, track) in self.state.tracks.iter().enumerate() {
-                            let track_rect = egui::Rect::from_min_size(
-                                egui::pos2(0.0, track_idx as f32 * (TRACK_HEIGHT + TRACK_SPACING)),
-                                egui::vec2(ui.available_width(), TRACK_HEIGHT),
-                            );
-                            
-                            if ui.rect_contains_pointer(track_rect) && ctx.input(|i| i.pointer.any_released()) {
-                                actions_clone.borrow_mut().push(UiAction::AddGroupToTrack(track.id, dragged_group.name));
-                                break;
+                        if let Some(grid_rect) = ctx.memory(|mem| mem.data.get_temp::<egui::Rect>(egui::Id::new("grid_rect"))) {
+                            if let Some(mouse_pos) = ctx.pointer_hover_pos() {
+                                eprintln!("DEBUG: Mouse position during group drag: {:?}", mouse_pos);
+                                eprintln!("DEBUG: Grid rect: {:?}", grid_rect);
+                                eprintln!("DEBUG: Mouse is inside grid: {}", grid_rect.contains(mouse_pos));
+                                eprintln!("DEBUG: Pointer released: {}", ctx.input(|i| i.pointer.any_released()));
+                                
+                                // For dragging from group panel, just check if mouse released inside grid
+                                let is_released_on_grid = grid_rect.contains(mouse_pos) && ctx.input(|i| i.pointer.any_released());
+                                
+                                if is_released_on_grid {
+                                    eprintln!("DEBUG: Group drop detected on grid (mouse released on grid)");
+                                    
+                                    // Calculate drop target using the grid's drop target system
+                                    if let Some(target) = drag_drop::calculate_drop_target(self, ctx, mouse_pos) {
+                                        eprintln!("DEBUG: Adding group '{}' to track {} at beat position {}", 
+                                            dragged_group.name, target.track_id, target.beat_position);
+                                            
+                                        // Check if we need to create a new track
+                                        if self.state.tracks.is_empty() {
+                                            eprintln!("DEBUG: No tracks available, creating a new track for the group");
+                                            actions_clone.borrow_mut().push(UiAction::CreateTrack);
+                                        }
+                                            
+                                        let group_name = dragged_group.name.clone();
+                                        actions_clone.borrow_mut().push(UiAction::AddGroupToTrack(target.track_id, group_name));
+                                        
+                                        // After adding the group, move it to the correct position
+                                        // We need to find the newly added group in the target track
+                                        if let Some(track) = self.state.tracks.iter_mut().find(|t| t.id == target.track_id) {
+                                            if let Some(sample) = track.samples.iter_mut().find(|s| 
+                                                s.item_type == TrackItemType::Group && s.name == dragged_group.name) {
+                                                // Move the sample to the drop position
+                                                actions_clone.borrow_mut().push(UiAction::SetSamplePosition {
+                                                    track_id: target.track_id,
+                                                    sample_id: sample.id,
+                                                    position: target.beat_position
+                                                });
+                                                eprintln!("DEBUG: Moving group '{}' to position {}", dragged_group.name, target.beat_position);
+                                            } else {
+                                                eprintln!("DEBUG: Could not find newly added group sample '{}'", dragged_group.name);
+                                            }
+                                        } else {
+                                            eprintln!("DEBUG: Could not find track with ID {}", target.track_id);
+                                        }
+                                    } else {
+                                        eprintln!("DEBUG: Failed to calculate drop target for group");
+                                    }
+                                    
+                                    // Clear the group drag flag
+                                    ctx.memory_mut(|mem| {
+                                        mem.data.insert_temp(egui::Id::new("group_drag_active"), false);
+                                        eprintln!("DEBUG: Set group_drag_active=false after drop");
+                                    });
+                                }
+                            } else {
+                                eprintln!("DEBUG: No mouse position available during group drag");
                             }
+                        } else {
+                            eprintln!("DEBUG: Grid rect not found during group drag");
+                        }
+                        
+                        // Clear dragged group state if mouse is released (whether over the grid or not)
+                        if ctx.input(|i| i.pointer.any_released()) {
+                            eprintln!("DEBUG: Mouse released while dragging group '{}'", dragged_group.name);
+                            ctx.memory_mut(|mem| {
+                                mem.data.remove::<Group>(egui::Id::new("dragged_group"));
+                                mem.data.insert_temp(egui::Id::new("group_drag_active"), false);
+                                eprintln!("DEBUG: Cleared dragged_group and set group_drag_active=false on release");
+                            });
+                            eprintln!("DEBUG: Drag ended: cleared dragged group state");
                         }
                     }
                 });
@@ -1310,6 +1400,9 @@ impl eframe::App for DawApp {
                     sample_id,
                 } => {
                     self.dispatch(DawAction::DeleteSample(*track_id, *sample_id));
+                }
+                UiAction::CreateTrack => {
+                    self.dispatch(DawAction::CreateTrack);
                 }
                 UiAction::CreateGroup(name) => {
                     self.dispatch(DawAction::CreateGroup(name.clone()));

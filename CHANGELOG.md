@@ -21,6 +21,9 @@
 [x] - drag audio files directly to the grid
 [x] - side panel should be in sync by width with the grid
 
+2025-04-07
+[x] - drag & drop improvements
+
 
 [] - store waveforms not in .monlam folder but in project folder in .monlam folder
 [] - investigate why .mp3 files loading took so long

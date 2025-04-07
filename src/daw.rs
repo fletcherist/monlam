@@ -56,6 +56,7 @@ pub enum DawAction {
     SwitchToTab(usize),        // Switch to a different tab by ID
     CloseTab(usize),           // Close a tab by ID
     SaveGroup(String),         // Save current Group state and update render.wav
+    CreateTrack,
 }
 
 const SAMPLE_RATE: u32 = 44100;
@@ -516,6 +517,18 @@ impl Default for Track {
 }
 
 impl Track {
+    // Create a new track with the given ID and name
+    pub fn new(id: usize, name: String) -> Self {
+        Self {
+            id,
+            name,
+            muted: false,
+            soloed: false,
+            recording: false,
+            samples: Vec::new(),
+        }
+    }
+    
     // Add a sample to the track
     pub fn add_sample(&mut self, mut sample: Sample) {
         // Generate a unique ID for the sample
@@ -605,6 +618,8 @@ pub struct DawState {
     pub active_tab_id: usize, // Currently active tab ID
     #[serde(default)]
     pub audio_boxes: Vec<String>, // List of AudioBox names in this project
+    pub next_track_id: usize,
+    pub modified: bool,
 }
 
 fn default_zoom_level() -> f32 {
@@ -648,6 +663,8 @@ impl Default for DawState {
             tabs: default_tabs(),
             active_tab_id: 0,
             audio_boxes: Vec::new(),
+            next_track_id: 5,
+            modified: false,
         }
     }
 }
@@ -1542,41 +1559,79 @@ impl DawApp {
                 }
             }
             DawAction::AddGroupToTrack(track_id, box_name) => {
-                // Implementation of adding an AudioBox to a track
+                // Implementation of adding a Group to a track
                 if let Some(project_path) = self.state.file_path.as_ref() {
                     if let Some(project_dir) = project_path.parent() {
                         let box_path = project_dir.join(&box_name);
                         if box_path.exists() {
-                            if let Err(e) = std::fs::remove_dir_all(&box_path) {
-                                eprintln!("Failed to delete AudioBox: {}", e);
+                            // Load the Group
+                            if let Ok(group) = Group::load(&box_path) {
+                                // First, check if this group exists in ANY track and remove it
+                                let mut source_track_id = None;
+                                let mut source_sample_id = None;
+                                
+                                // Search all tracks for this group
+                                for (track_idx, track) in self.state.tracks.iter().enumerate() {
+                                    if let Some(sample_idx) = track.samples.iter().position(|s| 
+                                        s.item_type == TrackItemType::Group && s.name == box_name) {
+                                        source_track_id = Some(track.id);
+                                        source_sample_id = Some(track.samples[sample_idx].id);
+                                        eprintln!("Found existing group '{}' in track {} with sample ID {}", 
+                                            box_name, track.id, track.samples[sample_idx].id);
+                                        break;
+                                    }
+                                }
+                                
+                                // If we found the group in another track, remove it
+                                if let (Some(source_track), Some(source_sample)) = (source_track_id, source_sample_id) {
+                                    if source_track != track_id {
+                                        // Remove from source track
+                                        if let Some(track) = self.state.tracks.iter_mut().find(|t| t.id == source_track) {
+                                            if let Some(pos) = track.samples.iter().position(|s| s.id == source_sample) {
+                                                track.samples.remove(pos);
+                                                eprintln!("Removed group '{}' from source track {}", box_name, source_track);
+                                            }
+                                        }
+                                    } else {
+                                        // Group is already in the target track, just update its position
+                                        eprintln!("Group '{}' is already in target track {}", box_name, track_id);
+                                        return;
+                                    }
+                                }
+                                
+                                // Find the target track
+                                if let Some(track) = self.state.tracks.iter_mut().find(|t| t.id == track_id) {
+                                    // Check if the group already exists in this track and remove it
+                                    let existing_group_index = track.samples.iter().position(|s| 
+                                        s.item_type == TrackItemType::Group && s.name == box_name);
+                                    
+                                    if let Some(index) = existing_group_index {
+                                        // Remove the existing group
+                                        track.samples.remove(index);
+                                        eprintln!("Removed existing group '{}' from track {}", box_name, track_id);
+                                    }
+                                    
+                                    // Create a new sample to represent the Group
+                                    let mut sample = Sample::default();
+                                    sample.name = box_name.clone();
+                                    sample.item_type = TrackItemType::Group;
+                                    sample.grid_position = 0.0; // This will be updated by the drag system
+                                    sample.grid_length = 4.0; // Default length of 4 beats
+                                    sample.waveform = Some(SampleWaveform {
+                                        samples: group.waveform.clone(),
+                                        sample_rate: 44100,
+                                        duration: 4.0, // Default duration of 4 seconds
+                                    });
+                                    
+                                    // Add the sample to the track
+                                    track.add_sample(sample);
+                                    eprintln!("Added Group '{}' to track {}", box_name, track_id);
+                                }
                             } else {
-                                // Remove the entry from audio_boxes
-                                if let Some(index) = self.state.audio_boxes.iter().position(|n| n == &box_name) {
-                                    self.state.audio_boxes.remove(index);
-                                }
-                                
-                                eprintln!("Deleted AudioBox: {}", box_name);
-                                
-                                // Also close any open tabs for this box
-                                let tabs_to_close: Vec<usize> = self.state.tabs.iter()
-                                    .filter(|t| t.is_group && t.group_name.as_ref().map_or(false, |n| n == &box_name))
-                                    .map(|t| t.id)
-                                    .collect();
-                                
-                                for tab_id in tabs_to_close {
-                                    if let Some(tab_index) = self.state.tabs.iter().position(|t| t.id == tab_id) {
-                                        self.state.tabs.remove(tab_index);
-                                        eprintln!("Closed tab for deleted AudioBox: {}", box_name);
-                                    }
-                                }
-                                
-                                // If we removed the active tab, switch to the first tab
-                                if self.state.tabs.iter().find(|t| t.id == self.state.active_tab_id).is_none() {
-                                    if let Some(first_tab) = self.state.tabs.first() {
-                                        self.state.active_tab_id = first_tab.id;
-                                    }
-                                }
+                                eprintln!("Failed to load Group: {}", box_name);
                             }
+                        } else {
+                            eprintln!("Group path does not exist: {:?}", box_path);
                         }
                     }
                 }
@@ -2105,6 +2160,17 @@ impl DawApp {
                     }
                 }
             }
+            DawAction::CreateTrack => {
+                // Create a new track with a unique ID
+                let new_id = self.state.next_track_id;
+                self.state.next_track_id += 1;
+                
+                // Add the track to the project
+                self.state.tracks.push(Track::new(new_id, format!("Track {}", new_id)));
+                
+                // Mark the project as modified
+                self.state.modified = true;
+            },
         }
     }
 
@@ -2296,6 +2362,8 @@ impl DawApp {
                 tabs: default_tabs(),
                 active_tab_id: 0,
                 audio_boxes: Vec::new(),
+                next_track_id: 5,
+                modified: false,
             },
             audio: Audio::new(),
             last_update: std::time::Instant::now(),

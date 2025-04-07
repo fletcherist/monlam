@@ -168,35 +168,45 @@ impl GroupPanel {
                         }
                     });
                 } else {
-                    let response = ui.selectable_label(is_selected, format!("📦 {}", group.name));
-                    
-                    if response.clicked() {
-                        self.selected_group_idx = Some(i);
-                    }
-                    
-                    // Double-click to open
-                    if response.double_clicked() {
-                        group_to_open = Some(group.clone());
-                    }
-                    
-                    // Context menu
-                    response.context_menu(|ui| {
-                        if ui.button("Open").clicked() {
+                    ui.horizontal(|ui| {
+                        let response = ui.selectable_label(is_selected, format!("📦 {}", group.name));
+                        
+                        if response.clicked() {
+                            self.selected_group_idx = Some(i);
+                        }
+                        
+                        // Double-click to open
+                        if response.double_clicked() {
                             group_to_open = Some(group.clone());
-                            ui.close_menu();
                         }
                         
-                        if ui.button("Rename").clicked() {
-                            self.renaming_group_idx = Some(i);
-                            self.new_name_buffer = group.name.clone();
-                            ui.close_menu();
+                        // Add a drag source
+                        let drag_source = ui.label("⋮⋮");
+                        
+                        // Make the group draggable
+                        if GroupPanel::make_group_draggable(ui, group, ctx) {
+                            // No need to draw visual again, already handled in make_group_draggable
                         }
                         
-                        if ui.button("Delete").clicked() {
-                            // Mark for deletion after the loop
-                            group_to_delete = Some(i);
-                            ui.close_menu();
-                        }
+                        // Context menu
+                        response.context_menu(|ui| {
+                            if ui.button("Open").clicked() {
+                                group_to_open = Some(group.clone());
+                                ui.close_menu();
+                            }
+                            
+                            if ui.button("Rename").clicked() {
+                                self.renaming_group_idx = Some(i);
+                                self.new_name_buffer = group.name.clone();
+                                ui.close_menu();
+                            }
+                            
+                            if ui.button("Delete").clicked() {
+                                // Mark for deletion after the loop
+                                group_to_delete = Some(i);
+                                ui.close_menu();
+                            }
+                        });
                     });
                 }
             }
@@ -236,77 +246,144 @@ impl GroupPanel {
     }
     
     /// Make the Group draggable with a waveform preview
-    pub fn make_group_draggable(&self, ui: &mut egui::Ui, group: &Group, ctx: &egui::Context) -> bool {
+    fn make_group_draggable(ui: &mut egui::Ui, group: &Group, ctx: &egui::Context) -> bool {
         let mut dragged = false;
         
-        // Create a preview of the Group
-        let preview_rect = ui.available_rect_before_wrap().shrink(4.0);
-        let preview_response = ui.allocate_rect(preview_rect, egui::Sense::click_and_drag());
+        // Create a smaller interaction area for better drag detection
+        let interaction_rect = ui.available_rect_before_wrap().shrink(8.0);
+        let response = ui.allocate_rect(interaction_rect, egui::Sense::click_and_drag());
         
-        if preview_response.dragged() {
+        // Debug output for interaction
+        if response.hovered() {
+            eprintln!("Hovering over group: {}", group.name);
+        }
+        
+        if response.dragged() {
+            eprintln!("Dragging group: {} (response.dragged=true, drag_delta={:?})", 
+                     group.name, ctx.input(|i| i.pointer.delta()));
             dragged = true;
             
             // Store the dragged Group
             ctx.memory_mut(|mem| {
                 mem.data.insert_temp(egui::Id::new("dragged_group"), group.clone());
+                // Also set a flag that a group is being dragged to notify other systems
+                mem.data.insert_temp(egui::Id::new("group_drag_active"), true);
+                eprintln!("DEBUG: Stored dragged group in memory: {} (group_drag_active=true)", group.name);
             });
             
-            // Show drag visual with waveform
-            egui::show_tooltip_at_pointer(ctx, ui.layer_id(), egui::Id::new("group_preview"), |ui| {
-                let preview_width = 200.0;
-                let preview_height = 60.0;
+            // Show drag visual with waveform - ALWAYS following the cursor as a popup
+            if let Some(pointer_pos) = ctx.pointer_hover_pos() {
+                eprintln!("Showing drag visual at {:?}", pointer_pos);
                 
-                let (rect, response) = ui.allocate_exact_size(
-                    egui::Vec2::new(preview_width, preview_height),
-                    egui::Sense::hover(),
-                );
-                
-                let painter = ui.painter();
-                
-                // Draw Group background
-                painter.rect_filled(rect, 4.0, egui::Color32::from_rgb(60, 60, 70));
-                painter.rect_stroke(rect, 4.0, egui::Stroke::new(1.0, SAMPLE_BORDER_COLOR), egui::StrokeKind::Inside);
-                
-                // Draw Group name
-                painter.text(
-                    egui::Pos2::new(rect.left() + 4.0, rect.top() + 12.0),
-                    egui::Align2::LEFT_TOP,
-                    &group.name,
-                    egui::FontId::proportional(10.0),
-                    TRACK_TEXT_COLOR,
-                );
-                
-                // Draw waveform if available
-                if !group.waveform.is_empty() {
-                    let waveform_height = rect.height() * 0.6;
-                    let center_y = rect.center().y;
+                // Create a floating area that follows the pointer instead of using popup
+                egui::Area::new(egui::Id::new("dragged_group_preview"))
+                    .fixed_pos(pointer_pos - egui::vec2(100.0, 30.0)) // Offset from pointer
+                    .order(egui::Order::Foreground) // Make sure it's on top
+                    .show(ctx, |ui| {
+                    ui.set_max_width(200.0);
                     
-                    let samples_per_pixel = (group.waveform.len() as f32 / rect.width()).max(1.0);
+                    let preview_width = 200.0;
+                    let preview_height = 60.0;
                     
-                    for x in 0..rect.width() as usize {
-                        let sample_idx = (x as f32 * samples_per_pixel) as usize;
-                        if sample_idx < group.waveform.len() {
-                            let amplitude = group.waveform[sample_idx];
-                            let y_offset = amplitude * (waveform_height / 2.0);
-                            
-                            // Draw waveform line
-                            painter.line_segment(
-                                [
-                                    egui::Pos2::new(rect.left() + x as f32, center_y - y_offset),
-                                    egui::Pos2::new(rect.left() + x as f32, center_y + y_offset),
-                                ],
-                                egui::Stroke::new(1.0, WAVEFORM_COLOR),
-                            );
+                    let (rect, _response) = ui.allocate_exact_size(
+                        egui::Vec2::new(preview_width, preview_height),
+                        egui::Sense::hover(),
+                    );
+                    
+                    let painter = ui.painter();
+                    
+                    // Draw Group background with 0.5 opacity - use a more noticeable color
+                    let bg_color = egui::Color32::from_rgba_premultiplied(80, 80, 180, 128); // 0.5 opacity blue
+                    painter.rect_filled(rect, 4.0, bg_color);
+                    
+                    // Add a more visible border
+                    let border_color = egui::Color32::from_rgb(150, 150, 255); // Brighter border
+                    painter.rect_stroke(rect, 4.0, egui::Stroke::new(2.0, border_color), egui::StrokeKind::Inside);
+                    
+                    // Draw Group name more prominently
+                    painter.text(
+                        egui::Pos2::new(rect.left() + 4.0, rect.top() + 12.0),
+                        egui::Align2::LEFT_TOP,
+                        &format!("⟳ {}", group.name), // Add an icon to show it's being dragged
+                        egui::FontId::proportional(14.0), // Larger font
+                        egui::Color32::WHITE,
+                    );
+                    
+                    // Draw "Dragging..." text
+                    painter.text(
+                        egui::Pos2::new(rect.left() + 4.0, rect.bottom() - 12.0),
+                        egui::Align2::LEFT_BOTTOM,
+                        "Dragging...",
+                        egui::FontId::proportional(10.0),
+                        egui::Color32::from_rgb(200, 200, 255),
+                    );
+                    
+                    // Draw waveform if available
+                    if !group.waveform.is_empty() {
+                        let waveform_height = rect.height() * 0.4; // Smaller to make room for text
+                        let center_y = rect.center().y;
+                        
+                        let samples_per_pixel = (group.waveform.len() as f32 / rect.width()).max(1.0);
+                        
+                        for x in 0..rect.width() as usize {
+                            let sample_idx = (x as f32 * samples_per_pixel) as usize;
+                            if sample_idx < group.waveform.len() {
+                                let amplitude = group.waveform[sample_idx];
+                                let y_offset = amplitude * (waveform_height / 2.0);
+                                
+                                // Draw waveform line with higher visibility
+                                let waveform_color = egui::Color32::from_rgb(200, 200, 255); // Brighter color
+                                painter.line_segment(
+                                    [
+                                        egui::Pos2::new(rect.left() + x as f32, center_y - y_offset),
+                                        egui::Pos2::new(rect.left() + x as f32, center_y + y_offset),
+                                    ],
+                                    egui::Stroke::new(1.0, waveform_color),
+                                );
+                            }
                         }
                     }
-                }
-            });
+                });
+                
+                // Also show a simpler floating indicator that follows the cursor exactly
+                // This ensures something is always visible during dragging
+                egui::Area::new(egui::Id::new("drag_cursor_indicator"))
+                    .fixed_pos(pointer_pos)
+                    .order(egui::Order::Foreground)
+                    .show(ctx, |ui| {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(255, 255, 255),
+                            format!("⟳ {}", group.name)
+                        );
+                    });
+            }
+        } else {
+            // Clear the drag state when not dragging
+            if ctx.input(|i| i.pointer.any_released()) {
+                eprintln!("DEBUG: Pointer released while not dragging, group: {}", group.name);
+                ctx.memory_mut(|mem| {
+                    // Double-check if this is actually the group being dragged before clearing
+                    if let Some(dragged) = mem.data.get_temp::<Group>(egui::Id::new("dragged_group")) {
+                        if dragged.name == group.name {
+                            eprintln!("DEBUG: Removing dragged group from memory: {}", group.name);
+                            mem.data.remove::<Group>(egui::Id::new("dragged_group"));
+                            mem.data.insert_temp(egui::Id::new("group_drag_active"), false);
+                            eprintln!("DEBUG: Set group_drag_active=false for {}", group.name);
+                        }
+                    }
+                    
+                    // Even if no dragged group is found, clear the active flag to be safe
+                    if mem.data.get_temp::<bool>(egui::Id::new("group_drag_active")).unwrap_or(false) {
+                        mem.data.insert_temp(egui::Id::new("group_drag_active"), false);
+                        eprintln!("DEBUG: Force set group_drag_active=false");
+                    }
+                });
+                eprintln!("DEBUG: Cleared drag state for group: {}", group.name);
+            }
         }
         
         dragged
     }
-
-
     
     /// Check if the given path matches the current folder
     pub fn is_current_folder(&self, path: &Path) -> bool {

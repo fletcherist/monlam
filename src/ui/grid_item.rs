@@ -227,7 +227,10 @@ impl<'a> GridItem<'a> {
 
         let mut interaction_occurred = false;
 
-        if region_response.clicked() {
+        // Handle single click (but skip if this is a double click on a group, which is handled separately)
+        let is_group_double_click = region_response.double_clicked() && self.item_type == TrackItemType::Group;
+        
+        if region_response.clicked() && !is_group_double_click {
             let selection = SelectionRect {
                 start_track_idx: self.track_idx,
                 start_beat: snap_to_grid(self.position),
@@ -242,8 +245,10 @@ impl<'a> GridItem<'a> {
         // Handle double click for groups
         if region_response.double_clicked() && self.item_type == TrackItemType::Group {
             if let Some(on_double_click) = on_group_double_click {
+                // Just call the callback without modifying the selection
                 on_double_click(self.track_id, self.item_id, self.item_name);
-                interaction_occurred = true;
+                // Return true to indicate interaction occurred, but don't modify any samples
+                return true;
             }
         }
 
