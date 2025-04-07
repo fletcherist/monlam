@@ -1,5 +1,5 @@
 use crate::audio::{load_audio, Audio};
-use crate::audio_box::AudioBox;
+use crate::group::Group;
 use crate::config::{load_waveform_data, save_waveform_data, WaveformData};
 use cpal::traits::StreamTrait;
 use rfd::FileDialog;
@@ -50,15 +50,15 @@ pub enum DawAction {
     SetZoomLevel(f32),         // Set the zoom level for the grid
     SetLoopRangeFromSelection, // Set loop range from current selection without toggling loop state
     SetLoopRange(f32, f32),    // Set loop start and end times in seconds
-    CreateAudioBox(String),    // Create a new AudioBox with the given name
-    RenameAudioBox(String, String), // Rename an AudioBox (old_name, new_name)
-    DeleteAudioBox(String),    // Delete an AudioBox by name
-    AddBoxToTrack(usize, String), // Add an AudioBox to a track (track_id, box_name)
-    RenderBoxFromSelection(String), // Render the current selection to an AudioBox
-    OpenBoxInNewTab(String),   // Open an AudioBox in a new tab (box_name)
+    CreateGroup(String),       // Create a new Group with the given name
+    RenameGroup(String, String), // Rename a Group (old_name, new_name)
+    DeleteGroup(String),       // Delete a Group by name
+    AddGroupToTrack(usize, String), // Add a Group to a track (track_id, group_name)
+    RenderGroupFromSelection(String), // Render the current selection to a Group
+    OpenGroupInNewTab(String), // Open a Group in a new tab (group_name)
     SwitchToTab(usize),        // Switch to a different tab by ID
     CloseTab(usize),           // Close a tab by ID
-    SaveAudioBox(String),      // Save current AudioBox state and update render.wav
+    SaveGroup(String),         // Save current Group state and update render.wav
 }
 
 const BUFFER_SIZE: usize = 1024;
@@ -71,11 +71,11 @@ pub struct SampleWaveform {
     pub duration: f32,
 }
 
-/// Type of item in a track - either a sample or an audio box
+/// Type of item in a track - either a sample or a group
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TrackItemType {
     Sample,
-    AudioBox,
+    Group,
 }
 
 impl Default for TrackItemType {
@@ -621,8 +621,8 @@ impl Track {
 pub struct Tab {
     pub id: usize,
     pub name: String,
-    pub is_audio_box: bool,
-    pub audio_box_name: Option<String>,
+    pub is_group: bool,
+    pub group_name: Option<String>,
 }
 
 impl Default for Tab {
@@ -630,8 +630,8 @@ impl Default for Tab {
         Self {
             id: 0,
             name: "Main".to_string(),
-            is_audio_box: false,
-            audio_box_name: None,
+            is_group: false,
+            group_name: None,
         }
     }
 }
@@ -1528,20 +1528,20 @@ impl DawApp {
                     self.state.loop_enabled = true;
                 }
             }
-            DawAction::CreateAudioBox(name) => {
-                // Implementation of creating a new AudioBox
+            DawAction::CreateGroup(name) => {
+                // Implementation of creating a new Group
                 if let Some(project_path) = self.state.file_path.as_ref() {
                     if let Some(project_dir) = project_path.parent() {
-                        match AudioBox::new(&name, project_dir) {
+                        match Group::new(&name, project_dir) {
                             Ok(_) => {
-                                eprintln!("Created new AudioBox: {}", name);
+                                eprintln!("Created new Group: {}", name);
                                 
-                                // Add this AudioBox to the list of known boxes
+                                // Add this Group to the list of known groups
                                 if !self.state.audio_boxes.contains(&name) {
                                     self.state.audio_boxes.push(name.clone());
                                 }
                                 
-                                // Create samples directory for the AudioBox
+                                // Create samples directory for the Group
                                 let box_path = project_dir.join(&name);
                                 let samples_dir = box_path.join("samples");
                                 if !samples_dir.exists() {
@@ -1550,7 +1550,7 @@ impl DawApp {
                                     }
                                 }
                                 
-                                // Copy selected samples to the AudioBox if there's a selection
+                                // Copy selected samples to the Group if there's a selection
                                 if let Some(selection) = &self.state.selection {
                                     let mut copied_samples = 0;
                                     
@@ -1568,10 +1568,10 @@ impl DawApp {
                                                             
                                                             // Copy the file
                                                             if let Err(e) = std::fs::copy(source_path, &target_path) {
-                                                                eprintln!("Failed to copy sample to AudioBox: {}", e);
+                                                                eprintln!("Failed to copy sample to Group: {}", e);
                                                             } else {
                                                                 copied_samples += 1;
-                                                                eprintln!("Copied sample to AudioBox: {:?}", target_path);
+                                                                eprintln!("Copied sample to Group: {:?}", target_path);
                                                             }
                                                         }
                                                     }
@@ -1580,26 +1580,26 @@ impl DawApp {
                                         }
                                     }
                                     
-                                    eprintln!("Copied {} samples to AudioBox '{}'", copied_samples, name);
+                                    eprintln!("Copied {} samples to Group '{}'", copied_samples, name);
                                 }
                             }
                             Err(e) => {
-                                eprintln!("Failed to create AudioBox: {}", e);
+                                eprintln!("Failed to create Group: {}", e);
                             }
                         }
                     }
                 } else {
-                    eprintln!("No project file path set, cannot create AudioBox");
+                    eprintln!("No project file path set, cannot create Group");
                 }
             }
-            DawAction::RenameAudioBox(old_name, new_name) => {
-                // Implementation of renaming an AudioBox
+            DawAction::RenameGroup(old_name, new_name) => {
+                // Implementation of renaming a Group
                 if let Some(project_path) = self.state.file_path.as_ref() {
                     if let Some(project_dir) = project_path.parent() {
                         let box_path = project_dir.join(&old_name);
-                        if let Ok(mut audio_box) = AudioBox::load(&box_path) {
+                        if let Ok(mut audio_box) = Group::load(&box_path) {
                             if let Err(e) = audio_box.rename(&new_name, project_dir) {
-                                eprintln!("Failed to rename AudioBox: {}", e);
+                                eprintln!("Failed to rename Group: {}", e);
                             } else {
                                 // Update the entry in audio_boxes
                                 if let Some(index) = self.state.audio_boxes.iter().position(|n| n == &old_name) {
@@ -1613,9 +1613,9 @@ impl DawApp {
                                 
                                 // Update tab names for this AudioBox
                                 for tab in &mut self.state.tabs {
-                                    if tab.is_audio_box && tab.audio_box_name.as_ref().map_or(false, |n| n == &old_name) {
+                                    if tab.is_group && tab.group_name.as_ref().map_or(false, |n| n == &old_name) {
                                         tab.name = format!("Box: {}", new_name);
-                                        tab.audio_box_name = Some(new_name.clone());
+                                        tab.group_name = Some(new_name.clone());
                                     }
                                 }
                             }
@@ -1623,32 +1623,40 @@ impl DawApp {
                     }
                 }
             }
-            DawAction::DeleteAudioBox(name) => {
-                // Implementation of deleting an AudioBox
+            DawAction::DeleteGroup(name) => {
+                // Implementation of deleting a Group
                 if let Some(project_path) = self.state.file_path.as_ref() {
                     if let Some(project_dir) = project_path.parent() {
-                        let box_path = project_dir.join(&name);
+                        // ... existing code ...
+                    }
+                }
+            }
+            DawAction::AddGroupToTrack(track_id, box_name) => {
+                // Implementation of adding an AudioBox to a track
+                if let Some(project_path) = self.state.file_path.as_ref() {
+                    if let Some(project_dir) = project_path.parent() {
+                        let box_path = project_dir.join(&box_name);
                         if box_path.exists() {
                             if let Err(e) = std::fs::remove_dir_all(&box_path) {
                                 eprintln!("Failed to delete AudioBox: {}", e);
                             } else {
                                 // Remove the entry from audio_boxes
-                                if let Some(index) = self.state.audio_boxes.iter().position(|n| n == &name) {
+                                if let Some(index) = self.state.audio_boxes.iter().position(|n| n == &box_name) {
                                     self.state.audio_boxes.remove(index);
                                 }
                                 
-                                eprintln!("Deleted AudioBox: {}", name);
+                                eprintln!("Deleted AudioBox: {}", box_name);
                                 
                                 // Also close any open tabs for this box
                                 let tabs_to_close: Vec<usize> = self.state.tabs.iter()
-                                    .filter(|t| t.is_audio_box && t.audio_box_name.as_ref().map_or(false, |n| n == &name))
+                                    .filter(|t| t.is_group && t.group_name.as_ref().map_or(false, |n| n == &box_name))
                                     .map(|t| t.id)
                                     .collect();
                                 
                                 for tab_id in tabs_to_close {
                                     if let Some(tab_index) = self.state.tabs.iter().position(|t| t.id == tab_id) {
                                         self.state.tabs.remove(tab_index);
-                                        eprintln!("Closed tab for deleted AudioBox: {}", name);
+                                        eprintln!("Closed tab for deleted AudioBox: {}", box_name);
                                     }
                                 }
                                 
@@ -1663,7 +1671,7 @@ impl DawApp {
                     }
                 }
             }
-            DawAction::AddBoxToTrack(track_id, box_name) => {
+            DawAction::AddGroupToTrack(track_id, box_name) => {
                 // Implementation of adding an AudioBox to a track
                 if let Some(project_path) = self.state.file_path.as_ref() {
                     if let Some(project_dir) = project_path.parent() {
@@ -1676,7 +1684,7 @@ impl DawApp {
                                     let mut sample = Sample::default();
                                     sample.audio_file = Some(render_path.clone());
                                     sample.name = box_name.clone();
-                                    sample.item_type = TrackItemType::AudioBox; // Mark this sample as an AudioBox
+                                    sample.item_type = TrackItemType::Group; // Mark this sample as a group
 
                                     // Try to load the audio file first
                                     if let Some(path) = &sample.audio_file {
@@ -1737,13 +1745,13 @@ impl DawApp {
                     }
                 }
             }
-            DawAction::RenderBoxFromSelection(box_name) => {
+            DawAction::RenderGroupFromSelection(box_name) => {
                 // Implementation of rendering the current selection to an AudioBox
                 if let Some(selection) = &self.state.selection {
                     if let Some(project_path) = self.state.file_path.as_ref() {
                         if let Some(project_dir) = project_path.parent() {
                             // Create the AudioBox
-                            match AudioBox::new(&box_name, project_dir) {
+                            match Group::new(&box_name, project_dir) {
                                 Ok(mut audio_box) => {
                                     // Get the selection data
                                     let start_track_idx = selection.start_track_idx;
@@ -1833,12 +1841,12 @@ impl DawApp {
                     eprintln!("Cannot render: No selection active");
                 }
             }
-            DawAction::OpenBoxInNewTab(box_name) => {
+            DawAction::OpenGroupInNewTab(box_name) => {
                 // Implementation of opening an AudioBox in a new tab
                 // First check if we already have a tab open for this box
                 if let Some(existing_tab) = self.state.tabs.iter().find(|t| 
-                    t.is_audio_box && 
-                    t.audio_box_name.as_ref().map_or(false, |name| name == &box_name)
+                    t.is_group && 
+                    t.group_name.as_ref().map_or(false, |name| name == &box_name)
                 ) {
                     // Stop any current playback before switching tabs
                     if self.state.is_playing {
@@ -1901,8 +1909,8 @@ impl DawApp {
                                         let tab = Tab {
                                             id: tab_id,
                                             name: format!("Box: {}", box_name),
-                                            is_audio_box: true,
-                                            audio_box_name: Some(box_name.clone()),
+                                            is_group: true,
+                                            group_name: Some(box_name.clone()),
                                         };
                                         
                                         // Store the current state
@@ -1970,8 +1978,8 @@ impl DawApp {
                             let tab = Tab {
                                 id: tab_id,
                                 name: format!("Box: {}", box_name),
-                                is_audio_box: true,
-                                audio_box_name: Some(box_name.clone()),
+                                is_group: true,
+                                group_name: Some(box_name.clone()),
                             };
                             
                             // Add the tab to tabs list
@@ -2082,7 +2090,7 @@ impl DawApp {
                     // Check if we're switching between different tab types (audio box vs project)
                     let current_tab = self.state.tabs.iter().find(|t| t.id == self.state.active_tab_id);
                     let is_switching_tab_types = current_tab.map_or(false, |current| {
-                        current.is_audio_box != tab.is_audio_box
+                        current.is_group != tab.is_group
                     });
                     
                     // If we're switching between tab types and playback is active, pause playback
@@ -2140,7 +2148,7 @@ impl DawApp {
                     eprintln!("Tab not found: {}", tab_id);
                 }
             }
-            DawAction::SaveAudioBox(box_name) => {
+            DawAction::SaveGroup(box_name) => {
                 // Implementation of saving an AudioBox state and updating its render.wav
                 if let Some(project_path) = self.state.file_path.as_ref() {
                     if let Some(project_dir) = project_path.parent() {
@@ -2167,8 +2175,8 @@ impl DawApp {
                         let box_state_path = box_path.join("state.json");
                         
                         if let Some(tab) = self.state.tabs.iter().find(|t| 
-                            t.is_audio_box && 
-                            t.audio_box_name.as_ref().map_or(false, |name| name == &box_name)
+                            t.is_group && 
+                            t.group_name.as_ref().map_or(false, |name| name == &box_name)
                         ) {
                             // Create a copy of the current state to save
                             let mut box_state = self.state.clone();
@@ -2313,8 +2321,8 @@ impl DawApp {
             
             // Check if we're in an audio box tab
             let active_tab = self.state.tabs.iter().find(|t| t.id == self.state.active_tab_id);
-            let is_audio_box_tab = active_tab.map_or(false, |tab| tab.is_audio_box);
-            let audio_box_name = active_tab.and_then(|tab| tab.audio_box_name.clone());
+            let is_audio_box_tab = active_tab.map_or(false, |tab| tab.is_group);
+            let audio_box_name = active_tab.and_then(|tab| tab.group_name.clone());
 
             for track in &mut self.state.tracks {
                 if track.muted || (any_track_soloed && !track.soloed) {
@@ -2327,7 +2335,7 @@ impl DawApp {
                         // In an audio box tab, only play samples with item_type == AudioBox that
                         // match the current audio box name
                         match &sample.item_type {
-                            TrackItemType::AudioBox => {
+                            TrackItemType::Group => {
                                 // If this sample doesn't represent the current audio box, skip it
                                 if sample.name != audio_box_name.clone().unwrap_or_default() {
                                     // Ensure we pause it if it's somehow playing
@@ -2348,7 +2356,7 @@ impl DawApp {
                         }
                     } else {
                         // In the main project tab, only play regular samples, not audio boxes
-                        if let TrackItemType::AudioBox = sample.item_type {
+                        if let TrackItemType::Group = sample.item_type {
                             // If we're in the main project tab, don't play AudioBox samples
                             if sample.is_playing {
                                 sample.pause();

@@ -4,18 +4,18 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-/// A AudioBox is a container for audio content that can be saved and reused in projects.
-/// Each AudioBox is stored as a folder in the project directory.
+/// A Group is a container for audio content that can be saved and reused in projects.
+/// Each Group is stored as a folder in the project directory.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AudioBox {
-    /// User-friendly name of the AudioBox
+pub struct Group {
+    /// User-friendly name of the Group
     pub name: String,
     
-    /// Path to the AudioBox folder
+    /// Path to the Group folder
     #[serde(skip)]
     pub path: PathBuf,
     
-    /// Path to the rendered audio file (typically {box_name}/render.wav)
+    /// Path to the rendered audio file (typically {group_name}/render.wav)
     #[serde(skip)]
     pub render_path: PathBuf,
     
@@ -32,60 +32,60 @@ pub struct AudioBox {
     pub duration: f32,
 }
 
-impl AudioBox {
-    /// Create a new AudioBox with the given name in the project directory
+impl Group {
+    /// Create a new Group with the given name in the project directory
     pub fn new(name: &str, project_dir: &Path) -> Result<Self, String> {
         // Validate the name
         if name.contains('/') {
-            return Err("Box name cannot contain '/'".to_string());
+            return Err("Group name cannot contain '/'".to_string());
         }
         
         if name.trim().is_empty() {
-            return Err("Box name cannot be empty".to_string());
+            return Err("Group name cannot be empty".to_string());
         }
         
-        // Create the box directory
-        let box_path = project_dir.join(name);
-        if box_path.exists() {
-            return Err(format!("A Box with name '{}' already exists", name));
+        // Create the group directory
+        let group_path = project_dir.join(name);
+        if group_path.exists() {
+            return Err(format!("A Group with name '{}' already exists", name));
         }
         
-        match fs::create_dir_all(&box_path) {
+        match fs::create_dir_all(&group_path) {
             Ok(_) => {
                 // Create empty render.wav placeholder
                 // The actual rendering happens separately
-                let render_path = box_path.join("render.wav");
+                let render_path = group_path.join("render.wav");
                 
                 Ok(Self {
                     name: name.to_string(),
-                    path: box_path,
+                    path: group_path,
                     render_path,
                     waveform: Vec::new(),
                     sample_rate: 44100, // Default sample rate
                     duration: 0.0,
                 })
             }
-            Err(e) => Err(format!("Failed to create Box directory: {}", e)),
+            Err(e) => Err(format!("Failed to create Group directory: {}", e)),
         }
     }
     
-    /// Load a AudioBox from an existing directory
-    pub fn load(box_path: &Path) -> Result<Self, String> {
-        if !box_path.exists() || !box_path.is_dir() {
-            return Err(format!("Box directory not found: {:?}", box_path));
+    /// Load a Group from an existing directory
+    pub fn load(group_path: &Path) -> Result<Self, String> {
+        if !group_path.exists() || !group_path.is_dir() {
+            return Err(format!("Group directory not found: {:?}", group_path));
         }
         
-        let name = box_path
+        let name = group_path
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("Unknown")
             .to_string();
         
-        let render_path = box_path.join("render.wav");
+        let render_path = group_path.join("render.wav");
         
         let mut result = Self {
             name,
-            path: box_path.to_path_buf(),
+            path: group_path.to_path_buf(),
             render_path: render_path.clone(),
             waveform: Vec::new(),
             sample_rate: 44100,
@@ -101,7 +101,7 @@ impl AudioBox {
                     result.duration = samples.len() as f32 / sample_rate as f32;
                 }
                 Err(e) => {
-                    eprintln!("Failed to load Box audio: {:?}", e);
+                    eprintln!("Failed to load Group audio: {:?}", e);
                 }
             }
         }
@@ -109,7 +109,7 @@ impl AudioBox {
         Ok(result)
     }
     
-    /// Render the AudioBox contents to render.wav
+    /// Render the Group contents to render.wav
     pub fn render(&mut self, audio_data: &[f32], sample_rate: u32) -> Result<(), String> {
         use hound::{SampleFormat, WavSpec, WavWriter};
         
@@ -117,7 +117,7 @@ impl AudioBox {
         if let Some(parent) = self.render_path.parent() {
             if !parent.exists() {
                 if let Err(e) = fs::create_dir_all(parent) {
-                    return Err(format!("Failed to create Box directory: {}", e));
+                    return Err(format!("Failed to create Group directory: {}", e));
                 }
             }
         }
@@ -162,37 +162,37 @@ impl AudioBox {
         Ok(())
     }
     
-    /// Rename the AudioBox (updates both name and directory)
+    /// Rename the Group (updates both name and directory)
     pub fn rename(&mut self, new_name: &str, project_dir: &Path) -> Result<(), String> {
         // Validate the new name
         if new_name.contains('/') {
-            return Err("Box name cannot contain '/'".to_string());
+            return Err("Group name cannot contain '/'".to_string());
         }
         
         if new_name.trim().is_empty() {
-            return Err("Box name cannot be empty".to_string());
+            return Err("Group name cannot be empty".to_string());
         }
         
-        // Create the new box directory path
-        let new_box_path = project_dir.join(new_name);
-        if new_box_path.exists() && new_box_path != self.path {
-            return Err(format!("A Box with name '{}' already exists", new_name));
+        // Create the new group directory path
+        let new_group_path = project_dir.join(new_name);
+        if new_group_path.exists() && new_group_path != self.path {
+            return Err(format!("A Group with name '{}' already exists", new_name));
         }
         
         // Rename the directory
-        if let Err(e) = fs::rename(&self.path, &new_box_path) {
-            return Err(format!("Failed to rename Box: {}", e));
+        if let Err(e) = fs::rename(&self.path, &new_group_path) {
+            return Err(format!("Failed to rename Group: {}", e));
         }
         
-        // Update the Box object
+        // Update the Group object
         self.name = new_name.to_string();
-        self.path = new_box_path;
+        self.path = new_group_path;
         self.render_path = self.path.join("render.wav");
         
         Ok(())
     }
     
-    /// Check if this AudioBox has a valid render file
+    /// Check if this Group has a valid render file
     pub fn has_render(&self) -> bool {
         self.render_path.exists()
     }

@@ -5,7 +5,7 @@ use crate::ui::main::{
     TRACK_TEXT_COLOR, WAVEFORM_COLOR,
 };
 use crate::ui::sample::{self, GridSampleHelper, SampleDragging};
-use crate::ui::audio_box_item::{self, GridBoxHelper, BoxDragging};
+use crate::ui::group_item::{self, GridGroupHelper, GroupDragging};
 use crate::daw::TrackItemType;
 use egui::{Color32, Stroke};
 
@@ -33,10 +33,12 @@ pub struct Grid<'a> {
     pub on_selection_change: &'a mut dyn FnMut(Option<SelectionRect>),
     pub on_playhead_position_change: &'a mut dyn FnMut(f32), // Callback when playhead position changes
     pub loop_enabled: bool,
-    pub on_toggle_loop: &'a mut dyn FnMut(), // Callback to toggle loop mode
+    pub loop_range: Option<(f32, f32)>, // Loop start and end times in seconds
+    pub on_group_double_click: &'a mut dyn FnMut(usize, usize, &str), // Callback when a group is double-clicked
+    pub snap_to_grid_enabled: bool,
+    pub seconds_per_pixel: f32,
     pub zoom_level: f32,                     // Zoom level for the grid view (1.0 = 100%)
     pub on_zoom_change: &'a mut dyn FnMut(f32),
-    pub on_box_double_click: &'a mut dyn FnMut(usize, usize, &str), // Callback when an AudioBox is double-clicked (track_id, box_id, box_name)
 }
 
 /// Trait for handling grid selection operations
@@ -130,11 +132,11 @@ impl<'a> Grid<'a> {
         // Track if the current frame processed a sample drag
         let mut sample_dragged_this_frame = false;
 
-        // Store the currently dragged audio box, if any
-        let dragged_box = ui.memory_mut(|mem| {
+        // Store the currently dragged group, if any
+        let dragged_group = ui.memory_mut(|mem| {
             mem.data
-                .get_persisted_mut_or_insert_with(ui.id().with("dragged_box"), || {
-                    None::<(usize, usize, f32)> // (track_id, box_id, initial_click_offset_in_beats)
+                .get_persisted_mut_or_insert_with(ui.id().with("dragged_group"), || {
+                    None::<(usize, usize, f32)> // (track_id, group_id, initial_click_offset_in_beats)
                 })
                 .clone()
         });
@@ -410,7 +412,7 @@ impl<'a> Grid<'a> {
             mem.data.insert_temp(egui::Id::new("grid_rect"), grid_rect);
             
             // Debug output to verify the grid rect is being stored
-            eprintln!("Grid rect stored: {:?}", grid_rect);
+            // eprintln!("Grid rect stored: {:?}", grid_rect);
         });
 
         // --- Define Coordinate Helper Functions HERE (Moved Earlier) ---
@@ -731,8 +733,8 @@ impl<'a> Grid<'a> {
                             &mut self.on_track_drag,
                         );
                     },
-                    TrackItemType::AudioBox => {
-                        audio_box_item::draw_audio_box(
+                    TrackItemType::Group => {
+                        group_item::draw_group(
                             ui,
                             &grid_rect,
                             &painter,
@@ -757,7 +759,7 @@ impl<'a> Grid<'a> {
                             &snap_to_grid,
                             &mut self.on_selection_change,
                             &mut self.on_track_drag,
-                            &mut self.on_box_double_click,
+                            &mut self.on_group_double_click,
                         );
                     }
                 }
@@ -786,17 +788,16 @@ impl<'a> Grid<'a> {
             }
         }
         
-        // Check if we have a dragged audio box from previous frames, and the mouse button is still down
-        if let Some((drag_track_id, drag_box_id, click_offset_beats)) = dragged_box {
+        // Check if we have a dragged group from previous frames, and the mouse button is still down
+        if let Some((drag_track_id, drag_group_id, click_offset_beats)) = dragged_group {
             if ui.input(|i| i.pointer.primary_down()) {
                 // Only process active drag if mouse button is still down
-                // Use the GridBoxHelper instead of the sample helper
-                audio_box_item::GridBoxHelper::process_active_drag(
+                group_item::GridGroupHelper::process_active_drag(
                     ui,
                     &grid_rect,
                     &self.tracks,
                     drag_track_id,
-                    drag_box_id,
+                    drag_group_id,
                     click_offset_beats,
                     &screen_x_to_beat,
                     &screen_y_to_track_index,
@@ -809,7 +810,7 @@ impl<'a> Grid<'a> {
             }
         }
 
-        // Check for end of dragging for both samples and audio boxes
+        // Check for end of dragging for both samples and groups
         if !ui.input(|i| i.pointer.primary_down()) {
             // End of drag for sample
             if let Some((drag_track_id, drag_sample_id, _)) = dragged_sample {
@@ -822,13 +823,13 @@ impl<'a> Grid<'a> {
                 });
             }
             
-            // End of drag for audio box
-            if let Some((drag_track_id, drag_box_id, _)) = dragged_box {
-                // Clear the dragged box reference
+            // End of drag for group
+            if let Some((drag_track_id, drag_group_id, _)) = dragged_group {
+                // Clear the dragged group reference
                 ui.memory_mut(|mem| {
                     *mem.data
                         .get_persisted_mut_or_default::<Option<(usize, usize, f32)>>(
-                            ui.id().with("dragged_box"),
+                            ui.id().with("dragged_group"),
                         ) = None;
                 });
             }
@@ -1490,9 +1491,9 @@ impl<'a> sample::SampleDragging for Grid<'a> {
     }
 }
 
-// Also implement the BoxDragging trait for Grid by delegating to GridBoxHelper
-impl<'a> audio_box_item::BoxDragging for Grid<'a> {
-    fn handle_box_dragging(
+// Also implement the GroupDragging trait for Grid by delegating to GridGroupHelper
+impl<'a> group_item::GroupDragging for Grid<'a> {
+    fn handle_group_dragging(
         ui: &mut egui::Ui,
         grid_rect: &egui::Rect,
         tracks: &Vec<(
@@ -1504,7 +1505,7 @@ impl<'a> audio_box_item::BoxDragging for Grid<'a> {
             Vec<(usize, String, f32, f32, Vec<f32>, u32, f32, f32, f32, TrackItemType)>,
         )>,
         drag_track_id: usize,
-        drag_box_id: usize,
+        drag_group_id: usize,
         click_offset_beats: f32,
         screen_x_to_beat: &dyn Fn(f32) -> f32,
         screen_y_to_track_index: &dyn Fn(f32) -> Option<usize>,
@@ -1513,12 +1514,12 @@ impl<'a> audio_box_item::BoxDragging for Grid<'a> {
         on_cross_track_move: &mut dyn FnMut(usize, usize, usize, f32),
         on_track_drag: &mut dyn FnMut(usize, usize, f32),
     ) {
-        audio_box_item::GridBoxHelper::handle_box_dragging(
+        group_item::GridGroupHelper::handle_group_dragging(
             ui,
             grid_rect,
             tracks,
             drag_track_id,
-            drag_box_id,
+            drag_group_id,
             click_offset_beats,
             screen_x_to_beat,
             screen_y_to_track_index,
@@ -1541,7 +1542,7 @@ impl<'a> audio_box_item::BoxDragging for Grid<'a> {
             Vec<(usize, String, f32, f32, Vec<f32>, u32, f32, f32, f32, TrackItemType)>,
         )>,
         drag_track_id: usize,
-        drag_box_id: usize,
+        drag_group_id: usize,
         click_offset_beats: f32,
         screen_x_to_beat: &dyn Fn(f32) -> f32,
         screen_y_to_track_index: &dyn Fn(f32) -> Option<usize>,
@@ -1551,12 +1552,12 @@ impl<'a> audio_box_item::BoxDragging for Grid<'a> {
         on_track_drag: &mut dyn FnMut(usize, usize, f32),
         on_selection_change: &mut dyn FnMut(Option<SelectionRect>),
     ) {
-        audio_box_item::GridBoxHelper::process_active_drag(
+        group_item::GridGroupHelper::process_active_drag(
             ui,
             grid_rect,
             tracks,
             drag_track_id,
-            drag_box_id,
+            drag_group_id,
             click_offset_beats,
             screen_x_to_beat,
             screen_y_to_track_index,
@@ -1568,20 +1569,20 @@ impl<'a> audio_box_item::BoxDragging for Grid<'a> {
         )
     }
 
-    fn move_box(
+    fn move_group(
         ui: &mut egui::Ui,
         source_track_id: usize,
-        box_id: usize,
+        group_id: usize,
         target_track_id: usize,
         new_position: f32,
         click_offset_beats: f32,
         on_cross_track_move: &mut dyn FnMut(usize, usize, usize, f32),
         on_track_drag: &mut dyn FnMut(usize, usize, f32),
     ) {
-        audio_box_item::GridBoxHelper::move_box(
+        group_item::GridGroupHelper::move_group(
             ui,
             source_track_id,
-            box_id,
+            group_id,
             target_track_id,
             new_position,
             click_offset_beats,
@@ -1590,7 +1591,7 @@ impl<'a> audio_box_item::BoxDragging for Grid<'a> {
         )
     }
 
-    fn end_box_drag(
+    fn end_group_drag(
         ui: &mut egui::Ui,
         tracks: &Vec<(
             usize,
@@ -1601,15 +1602,15 @@ impl<'a> audio_box_item::BoxDragging for Grid<'a> {
             Vec<(usize, String, f32, f32, Vec<f32>, u32, f32, f32, f32, TrackItemType)>,
         )>,
         drag_track_id: usize,
-        drag_box_id: usize,
+        drag_group_id: usize,
         selection: Option<&SelectionRect>,
         on_selection_change: &mut dyn FnMut(Option<SelectionRect>),
     ) {
-        audio_box_item::GridBoxHelper::end_box_drag(
+        group_item::GridGroupHelper::end_group_drag(
             ui,
             tracks,
             drag_track_id,
-            drag_box_id,
+            drag_group_id,
             selection,
             on_selection_change,
         )

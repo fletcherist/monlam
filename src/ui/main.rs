@@ -1,8 +1,9 @@
 use crate::daw::{DawAction, DawApp, SelectionRect, TrackItemType};
+use crate::group::Group;
 use crate::ui::grid::Grid;
 use crate::ui::file_browser::FileBrowserPanel;
-use crate::ui::audio_box_panel::AudioBoxPanel;
-use crate::audio_box::AudioBox;
+use crate::ui::group_panel::GroupPanel;
+use crate::audio::Audio;
 use crate::ui::drag_drop;
 use eframe::egui;
 use egui::{Color32, Key, RichText, Stroke};
@@ -22,7 +23,7 @@ pub const TRACK_BORDER_COLOR: Color32 = Color32::from_rgb(60, 60, 60);
 pub const TRACK_TEXT_COLOR: Color32 = Color32::from_rgb(200, 200, 200);
 pub const WAVEFORM_COLOR: Color32 = Color32::from_rgb(100, 100, 100);
 pub const SAMPLE_BORDER_COLOR: Color32 = Color32::from_rgb(60, 60, 60);
-pub const AUDIO_BOX_COLOR: Color32 = Color32::from_rgb(100, 120, 180); // Distinct blue color for AudioBox samples
+pub const GROUP_COLOR: Color32 = Color32::from_rgb(100, 120, 180); // Distinct blue color for Group samples
 pub const SCROLLBAR_SIZE: f32 = 14.0;
 pub const BASE_PIXELS_PER_BEAT: f32 = 50.0; // Base pixels per beat at zoom level 1.0
 
@@ -302,7 +303,7 @@ impl<'a> TrackControls<'a> {
 }
 
 struct TabsBar<'a> {
-    tabs: Vec<(usize, String, bool, bool)>, // id, name, is_active, is_audio_box
+    tabs: Vec<(usize, String, bool, bool)>, // id, name, is_active, is_group
     on_tab_select: &'a mut dyn FnMut(usize),
     on_tab_close: &'a mut dyn FnMut(usize),
 }
@@ -310,9 +311,9 @@ struct TabsBar<'a> {
 impl<'a> TabsBar<'a> {
     pub fn draw(mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            for (id, name, is_active, is_audio_box) in &self.tabs {
+            for (id, name, is_active, is_group) in &self.tabs {
                 // Create a styled button for each tab
-                let button_text = if *is_audio_box {
+                let button_text = if *is_group {
                     format!("📦 {}", name)
                 } else {
                     format!("📄 {}", name)
@@ -452,13 +453,13 @@ impl eframe::App for DawApp {
 
         // Check if we're in an audio box tab or the main project tab
         let active_tab = self.state.tabs.iter().find(|t| t.id == self.state.active_tab_id);
-        let is_audio_box_tab = active_tab.map_or(false, |tab| tab.is_audio_box);
-        let audio_box_name = active_tab.and_then(|tab| tab.audio_box_name.clone());
+        let is_group_tab = active_tab.map_or(false, |tab| tab.is_group);
+        let group_name = active_tab.and_then(|tab| tab.group_name.clone());
         
         // Prepare track info based on active tab
-        let track_info: Vec<_>;
+        let track_info: Vec<(usize, String, bool, bool, bool, Vec<(usize, String, f32, f32, Vec<f32>, u32, f32, f32, f32, TrackItemType)>)>;
         
-        if is_audio_box_tab {
+        if is_group_tab {
             // Create temporary tracks for the audio box - use the same number of tracks as default project
             let mut temp_tracks = Vec::new();
             
@@ -469,8 +470,8 @@ impl eframe::App for DawApp {
                 let mut samples = Vec::new();
                 
                 // Only put the audio box in the first track
-                if i == 0 && audio_box_name.is_some() {
-                    if let Some(box_name) = &audio_box_name {
+                if i == 0 && group_name.is_some() {
+                    if let Some(box_name) = &group_name {
                         // Load the AudioBox data from disk
                         if let Some(project_path) = self.state.file_path.as_ref() {
                             if let Some(project_dir) = project_path.parent() {
@@ -488,16 +489,16 @@ impl eframe::App for DawApp {
                                         
                                         // Create a sample info entry representing the audio box
                                         let sample_info = (
-                                            0, // sample id
+                                            0usize, // sample id
                                             box_name.clone(),
-                                            0.0, // position
+                                            0.0f32, // position
                                             duration * (bpm / 60.0), // length in beats
                                             waveform_data, 
                                             rate,
                                             duration,
-                                            0.0, // trim_start (audio_start_time)
+                                            0.0f32, // audio_start_time
                                             duration, // audio_end_time
-                                            TrackItemType::AudioBox,
+                                            TrackItemType::Group,
                                         );
                                         
                                         // Add the box to the track's samples
@@ -560,7 +561,7 @@ impl eframe::App for DawApp {
                                 full_duration,
                                 audio_start_time,
                                 audio_end_time,
-                                sample.item_type,
+                                sample.item_type.clone(),
                             )
                         })
                         .collect();
@@ -580,7 +581,7 @@ impl eframe::App for DawApp {
         // Prepare controls info based on active tab
         let track_controls_info: Vec<_>;
         
-        if is_audio_box_tab {
+        if is_group_tab {
             // For audio box tabs, create matching controls for our temporary tracks
             let mut temp_controls = Vec::new();
             
@@ -591,8 +592,8 @@ impl eframe::App for DawApp {
                 let mut samples = Vec::new();
                 
                 // Only put the audio box in the first track
-                if i == 0 && audio_box_name.is_some() {
-                    if let Some(box_name) = &audio_box_name {
+                if i == 0 && group_name.is_some() {
+                    if let Some(box_name) = &group_name {
                         // Get audio data for duration
                         let mut duration = 0.0;
                         
@@ -730,15 +731,15 @@ impl eframe::App for DawApp {
             ToggleLoopSelection,
             SetLoopRangeFromSelection,
             SetZoomLevel(f32),
-            CreateAudioBox(String),
-            RenameAudioBox(String, String),
-            DeleteAudioBox(String),
-            AddBoxToTrack(usize, String),
-            RenderBoxFromSelection(String),
-            OpenBoxInNewTab(String),
+            CreateGroup(String),
+            RenameGroup(String, String),
+            DeleteGroup(String),
+            AddGroupToTrack(usize, String),
+            RenderGroupFromSelection(String),
+            OpenGroupInNewTab(String),
             SwitchToTab(usize),
             CloseTab(usize),
-            SaveAudioBox(String),
+            SaveGroup(String),
         }
 
         // Collect actions during UI rendering using Rc<RefCell>
@@ -833,8 +834,8 @@ impl eframe::App for DawApp {
                                 let project_path_ref = project_path.clone();
                                 ctx.memory_mut(|mem| {
                                     // Update the AudioBox panel with the new project path
-                                    let new_box_panel = AudioBoxPanel::new(Some(&project_path_ref));
-                                    mem.data.insert_temp(egui::Id::new("audio_box_panel"), new_box_panel);
+                                    let new_box_panel = GroupPanel::new(Some(&project_path_ref));
+                                    mem.data.insert_temp(egui::Id::new("group_panel"), new_box_panel);
                                 });
                             } else {
                                 file_browser.refresh();
@@ -862,8 +863,8 @@ impl eframe::App for DawApp {
             mem.data.insert_temp(egui::Id::new("file_browser"), file_browser);
         });
         
-        // Create an AudioBox panel structure with the project directory
-        let mut audio_box_panel = if let Some(stored_panel) = ctx.memory(|mem| mem.data.get_temp::<AudioBoxPanel>(egui::Id::new("audio_box_panel"))) {
+        // Create a group panel structure with the project directory
+        let mut group_panel = if let Some(stored_panel) = ctx.memory(|mem| mem.data.get_temp::<GroupPanel>(egui::Id::new("group_panel"))) {
             stored_panel
         } else {
             // Get the current project folder from the state.file_path
@@ -871,69 +872,46 @@ impl eframe::App for DawApp {
                 .and_then(|path| path.parent())
                 .map(|path| path.to_path_buf());
             
-            AudioBoxPanel::new(project_folder.as_deref())
+            GroupPanel::new(project_folder.as_deref())
         };
         
         // Draw AudioBox panel with the same width as file browser panel
         let mut box_panel_shown = panel_shown; // Use the same visibility as file browser
-        egui::SidePanel::left("audio_box_panel")
-            .default_width(new_panel_width)
-            .resizable(false)
-            .show_animated(ctx, box_panel_shown, |ui| {
-                let actions_clone = actions.clone();
-                
-                // Add a button to create a new Box from selection
-                if ui.button("Create Box from Selection").clicked() {
-                    // Check if there's a selection
-                    if self.state.selection.is_some() {
-                        // Show a simple dialog to get the Box name using a MessageDialog
-                        let name = rfd::FileDialog::new()
-                            .set_title("Create Box from Selection")
-                            .set_file_name("New Box Name")
-                            .save_file();
-                        
-                        if let Some(path) = name {
-                            if let Some(file_name) = path.file_name() {
-                                let name = file_name.to_string_lossy().to_string();
-                                if !name.trim().is_empty() && !name.contains('/') {
-                                    actions_clone.borrow_mut().push(UiAction::RenderBoxFromSelection(name));
-                                    // We'll refresh the panel when it's next rendered
-                                } else {
-                                    eprintln!("Invalid Box name: must not be empty or contain '/'");
-                                }
+        
+        if panel_shown {
+            let actions_clone = actions.clone();
+            egui::SidePanel::left("box_panel")
+                .exact_width(new_panel_width)
+                .frame(egui::Frame::none())
+                .resizable(false)
+                .show_separator_line(false)
+                .show(ctx, |ui| {
+                    if let Some(group_to_open) = group_panel.draw(ui, ctx) {
+                        // When a group is opened, open it in a new tab with empty project and tracks
+                        actions_clone.borrow_mut().push(UiAction::OpenGroupInNewTab(group_to_open.name));
+                    }
+                    
+                    // Handle group dragging - check if a group is being dragged
+                    if let Some(dragged_group) = ctx.memory(|mem| mem.data.get_temp::<Group>(egui::Id::new("dragged_group"))) {
+                        // If we detect a drop on the grid area
+                        for (track_idx, track) in self.state.tracks.iter().enumerate() {
+                            let track_rect = egui::Rect::from_min_size(
+                                egui::pos2(0.0, track_idx as f32 * (TRACK_HEIGHT + TRACK_SPACING)),
+                                egui::vec2(ui.available_width(), TRACK_HEIGHT),
+                            );
+                            
+                            if ui.rect_contains_pointer(track_rect) && ctx.input(|i| i.pointer.any_released()) {
+                                actions_clone.borrow_mut().push(UiAction::AddGroupToTrack(track.id, dragged_group.name));
+                                break;
                             }
                         }
-                    } else {
-                        eprintln!("Cannot create Box: No selection active");
                     }
-                }
-                
-                // Handle box interactions, returns an option of the box to open if any
-                if let Some(box_to_open) = audio_box_panel.draw(ui, ctx) {
-                    // When a box is opened, open it in a new tab with empty project and tracks
-                    actions_clone.borrow_mut().push(UiAction::OpenBoxInNewTab(box_to_open.name));
-                }
-                
-                // Handle box dragging - check if a box is being dragged
-                if let Some(dragged_box) = ctx.memory(|mem| mem.data.get_temp::<AudioBox>(egui::Id::new("dragged_box"))) {
-                    // If we detect a drop on the grid area
-                    for (track_idx, track) in self.state.tracks.iter().enumerate() {
-                        let track_rect = egui::Rect::from_min_size(
-                            egui::pos2(0.0, track_idx as f32 * (TRACK_HEIGHT + TRACK_SPACING)),
-                            egui::vec2(ui.available_width(), TRACK_HEIGHT),
-                        );
-                        
-                        if ui.rect_contains_pointer(track_rect) && ctx.input(|i| i.pointer.any_released()) {
-                            actions_clone.borrow_mut().push(UiAction::AddBoxToTrack(track.id, dragged_box.name));
-                            break;
-                        }
-                    }
-                }
-            });
+                });
+        }
         
-        // Store the updated audio box panel
+        // Store the updated group panel
         ctx.memory_mut(|mem| {
-            mem.data.insert_temp(egui::Id::new("audio_box_panel"), audio_box_panel);
+            mem.data.insert_temp(egui::Id::new("group_panel"), group_panel);
         });
 
         // Complete the UI with the central grid and track panels AFTER side panel
@@ -966,7 +944,7 @@ impl eframe::App for DawApp {
                             tab.id, 
                             tab.name.clone(), 
                             tab.id == self.state.active_tab_id,
-                            tab.is_audio_box
+                            tab.is_group
                         )
                     }).collect(),
                     on_tab_select: &mut |id| {
@@ -981,9 +959,9 @@ impl eframe::App for DawApp {
                 // Grid in the middle
                 let actions_clone = actions.clone();
                 let mut grid = Grid {
-                    timeline_position,
-                    bpm,
-                    grid_division,
+                    timeline_position: self.state.timeline_position,
+                    bpm: self.state.bpm,
+                    grid_division: self.state.grid_division,
                     tracks: track_info,
                     on_track_drag: &mut |track_id, sample_id, position| {
                         actions_clone.borrow_mut().push(UiAction::TrackDrag {
@@ -992,15 +970,14 @@ impl eframe::App for DawApp {
                             position,
                         });
                     },
-                    on_cross_track_move:
-                        &mut |source_track_id, sample_id, target_track_id, position| {
-                            actions_clone.borrow_mut().push(UiAction::CrossTrackMove {
-                                source_track_id,
-                                sample_id,
-                                target_track_id,
-                                position,
-                            });
-                        },
+                    on_cross_track_move: &mut |source_track_id, sample_id, target_track_id, position| {
+                        actions_clone.borrow_mut().push(UiAction::CrossTrackMove {
+                            source_track_id,
+                            sample_id,
+                            target_track_id,
+                            position,
+                        });
+                    },
                     on_track_mute: &mut |track_id| {
                         actions_clone
                             .borrow_mut()
@@ -1025,32 +1002,30 @@ impl eframe::App for DawApp {
                     h_scroll_offset: self.state.h_scroll_offset,
                     v_scroll_offset: self.state.v_scroll_offset,
                     selection: self.state.selection.clone(),
-                    on_selection_change: &mut |new_selection: Option<SelectionRect>| {
+                    on_selection_change: &mut |selection| {
                         actions_clone
                             .borrow_mut()
-                            .push(UiAction::SetSelection(new_selection));
+                            .push(UiAction::SetSelection(selection));
+                    },
+                    on_playhead_position_change: &mut |position| {
+                        actions_clone
+                            .borrow_mut()
+                            .push(UiAction::SetTimelinePosition(position));
                     },
                     loop_enabled: self.state.loop_enabled,
-                    on_toggle_loop: &mut || {
+                    loop_range: self.state.loop_range,
+                    on_group_double_click: &mut |track_id, group_id, group_name| {
                         actions_clone
                             .borrow_mut()
-                            .push(UiAction::ToggleLoopSelection);
+                            .push(UiAction::OpenGroupInNewTab(group_name.to_string()));
                     },
+                    snap_to_grid_enabled: true,
+                    seconds_per_pixel: 0.01, // Will be calculated in grid.draw()
                     zoom_level: self.state.zoom_level,
-                    on_zoom_change: &mut |new_zoom| {
+                    on_zoom_change: &mut |zoom_level| {
                         actions_clone
                             .borrow_mut()
-                            .push(UiAction::SetZoomLevel(new_zoom));
-                    },
-                    on_playhead_position_change: &mut |new_position| {
-                        actions_clone
-                            .borrow_mut()
-                            .push(UiAction::SetTimelinePosition(new_position));
-                    },
-                    on_box_double_click: &mut |_track_id, _box_id, box_name| {
-                        actions_clone
-                            .borrow_mut()
-                            .push(UiAction::OpenBoxInNewTab(box_name.to_string()));
+                            .push(UiAction::SetZoomLevel(zoom_level));
                     },
                 };
                 grid.draw(ui);
@@ -1122,8 +1097,8 @@ impl eframe::App for DawApp {
                 .draw(ui);
 
                 // Add a button to save the audio box when it's open in a tab
-                if is_audio_box_tab {
-                    if let Some(box_name) = &audio_box_name {
+                if is_group_tab {
+                    if let Some(box_name) = &group_name {
                         ui.horizontal(|ui| {
                             ui.add_space(8.0);
                             
@@ -1132,11 +1107,11 @@ impl eframe::App for DawApp {
                             
                             ui.add_space(ui.available_width() - 120.0);
                             
-                            if ui.button(RichText::new("💾 Save Box").size(14.0))
-                                .on_hover_text("Save AudioBox and update render.wav")
+                            if ui.button(RichText::new("💾 Save Group").size(14.0))
+                                .on_hover_text("Save Group and update render.wav")
                                 .clicked() 
                             {
-                                actions_clone.borrow_mut().push(UiAction::SaveAudioBox(box_name.clone()));
+                                actions_clone.borrow_mut().push(UiAction::SaveGroup(box_name.clone()));
                             }
                         });
                         
@@ -1240,11 +1215,11 @@ impl eframe::App for DawApp {
                     {
                         // Get the path where to copy the sample if we're in an AudioBox
                         let active_tab = self.state.tabs.iter().find(|t| t.id == self.state.active_tab_id);
-                        let is_audio_box_tab = active_tab.map_or(false, |tab| tab.is_audio_box);
+                        let is_group_tab = active_tab.map_or(false, |tab| tab.is_group);
                         
-                        if is_audio_box_tab {
+                        if is_group_tab {
                             // If we're in an audio box, we first need to copy the file to the samples directory
-                            if let Some(box_name) = active_tab.and_then(|tab| tab.audio_box_name.clone()) {
+                            if let Some(box_name) = active_tab.and_then(|tab| tab.group_name.clone()) {
                                 if let Some(project_path) = self.state.file_path.as_ref() {
                                     if let Some(project_dir) = project_path.parent() {
                                         let box_path = project_dir.join(&box_name);
@@ -1270,7 +1245,7 @@ impl eframe::App for DawApp {
                                         // Use the copied file path for the sample
                                         self.dispatch(DawAction::AddSampleToTrack(*track_id, target_path));
                                         
-                                        eprintln!("Added sample to AudioBox '{}' at track {}", box_name, track_id);
+                                eprintln!("Added sample to AudioBox '{}' at track {}", box_name, track_id);
                                     }
                                 }
                             }
@@ -1336,23 +1311,23 @@ impl eframe::App for DawApp {
                 } => {
                     self.dispatch(DawAction::DeleteSample(*track_id, *sample_id));
                 }
-                UiAction::CreateAudioBox(name) => {
-                    self.dispatch(DawAction::CreateAudioBox(name.clone()));
+                UiAction::CreateGroup(name) => {
+                    self.dispatch(DawAction::CreateGroup(name.clone()));
                 }
-                UiAction::RenameAudioBox(old_name, new_name) => {
-                    self.dispatch(DawAction::RenameAudioBox(old_name.clone(), new_name.clone()));
+                UiAction::RenameGroup(old_name, new_name) => {
+                    self.dispatch(DawAction::RenameGroup(old_name.clone(), new_name.clone()));
                 }
-                UiAction::DeleteAudioBox(name) => {
-                    self.dispatch(DawAction::DeleteAudioBox(name.clone()));
+                UiAction::DeleteGroup(name) => {
+                    self.dispatch(DawAction::DeleteGroup(name.clone()));
                 }
-                UiAction::AddBoxToTrack(track_id, name) => {
-                    self.dispatch(DawAction::AddBoxToTrack(*track_id, name.clone()));
+                UiAction::AddGroupToTrack(track_id, name) => {
+                    self.dispatch(DawAction::AddGroupToTrack(*track_id, name.clone()));
                 }
-                UiAction::RenderBoxFromSelection(name) => {
-                    self.dispatch(DawAction::RenderBoxFromSelection(name.clone()));
+                UiAction::RenderGroupFromSelection(name) => {
+                    self.dispatch(DawAction::RenderGroupFromSelection(name.clone()));
                 }
-                UiAction::OpenBoxInNewTab(name) => {
-                    self.dispatch(DawAction::OpenBoxInNewTab(name.clone()));
+                UiAction::OpenGroupInNewTab(name) => {
+                    self.dispatch(DawAction::OpenGroupInNewTab(name.clone()));
                 }
                 UiAction::SwitchToTab(tab_id) => {
                     self.dispatch(DawAction::SwitchToTab(*tab_id));
@@ -1360,8 +1335,8 @@ impl eframe::App for DawApp {
                 UiAction::CloseTab(tab_id) => {
                     self.dispatch(DawAction::CloseTab(*tab_id));
                 }
-                UiAction::SaveAudioBox(box_name) => {
-                    self.dispatch(DawAction::SaveAudioBox(box_name.clone()));
+                UiAction::SaveGroup(box_name) => {
+                    self.dispatch(DawAction::SaveGroup(box_name.clone()));
                 }
             }
         }

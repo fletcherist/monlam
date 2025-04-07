@@ -2,7 +2,7 @@ mod audio;
 mod config;
 mod daw;
 mod ui;
-mod audio_box;
+mod group;
 
 use daw::DawApp;
 use eframe::egui;
