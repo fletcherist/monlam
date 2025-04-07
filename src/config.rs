@@ -15,10 +15,6 @@ pub struct WaveformData {
     pub duration: f32,
 }
 
-pub fn get_config_path() -> PathBuf {
-    let home = env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    Path::new(&home).join(".monlam").join("config.json")
-}
 
 pub fn get_project_dir(project_path: &Path) -> PathBuf {
     let project_folder = project_path.parent().unwrap_or(Path::new("")).to_path_buf();
@@ -88,7 +84,6 @@ pub fn load_waveform_data(waveform_path: &Path) -> Option<WaveformData> {
     // If current path is in .monlam folder, try project folder
     else if waveform_path.to_string_lossy().contains(".monlam") {
         // Extract the project name and filename
-        let filename = waveform_path.file_name().unwrap_or_default();
         
         // Since we don't know the project folder path, we can't load from it
         // This would require more context about the current project path
@@ -99,25 +94,4 @@ pub fn load_waveform_data(waveform_path: &Path) -> Option<WaveformData> {
     None
 }
 
-pub fn save_config(project_path: Option<PathBuf>) {
-    let config = Config {
-        latest_project: project_path,
-    };
-    if let Ok(serialized) = serde_json::to_string_pretty(&config) {
-        let config_path = get_config_path();
-        if let Some(parent) = config_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let _ = fs::write(config_path, serialized);
-    }
-}
 
-pub fn load_config() -> Option<PathBuf> {
-    let config_path = get_config_path();
-    if let Ok(contents) = fs::read_to_string(config_path) {
-        if let Ok(config) = serde_json::from_str::<Config>(&contents) {
-            return config.latest_project;
-        }
-    }
-    None
-}

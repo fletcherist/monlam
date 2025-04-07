@@ -1,11 +1,11 @@
 use crate::daw::SelectionRect;
 use crate::ui::main::{
     BAR_LINE_COLOR, BASE_PIXELS_PER_BEAT, BEAT_LINE_COLOR, GRID_BACKGROUND, PLAYHEAD_COLOR,
-    SAMPLE_BORDER_COLOR, SCROLLBAR_SIZE, TRACK_BORDER_COLOR, TRACK_HEIGHT, TRACK_SPACING,
-    TRACK_TEXT_COLOR, WAVEFORM_COLOR,
+     SCROLLBAR_SIZE, TRACK_BORDER_COLOR, TRACK_HEIGHT, TRACK_SPACING,
+    TRACK_TEXT_COLOR,
 };
-use crate::ui::sample::{self, GridSampleHelper, SampleDragging};
-use crate::ui::group_item::{self, GridGroupHelper, GroupDragging};
+use crate::ui::sample::{self, SampleDragging};
+use crate::ui::group_item::{self, GroupDragging};
 use crate::daw::TrackItemType;
 use egui::{Color32, Stroke};
 
@@ -723,7 +723,6 @@ impl<'a> Grid<'a> {
                             *position,
                             *length,
                             waveform,
-                            *sample_rate,
                             *duration,
                             *audio_start_time,
                             *audio_end_time,

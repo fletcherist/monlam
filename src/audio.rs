@@ -1,11 +1,8 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use rfd::MessageDialog;
 use std::fmt;
 use std::fs::File;
 use std::io;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
 use symphonia::core::audio::AudioBufferRef;
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::probe::Hint;

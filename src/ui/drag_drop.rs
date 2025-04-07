@@ -77,7 +77,6 @@ pub fn draw_drop_overlay(ctx: &egui::Context, drag_active: bool) {
 pub struct DropTarget {
     pub track_id: usize,
     pub beat_position: f32,
-    pub is_valid: bool,
 }
 
 /// Calculate drop target information from mouse position
@@ -128,7 +127,6 @@ pub fn calculate_drop_target(
         return Some(DropTarget {
             track_id,
             beat_position: snapped_beat,
-            is_valid: true,
         });
     } else {
         eprintln!("Grid rect not found in memory");
@@ -255,14 +253,3 @@ pub fn is_drag_active(ctx: &egui::Context) -> bool {
     internal_drag || external_drag
 }
 
-/// Check if a position is over a track in the grid area
-pub fn is_position_over_track(ui: &egui::Ui, track_idx: usize, track_height: f32, track_spacing: f32) -> bool {
-    let track_top = track_idx as f32 * (track_height + track_spacing);
-    let track_bottom = track_top + track_height;
-    
-    if let Some(pos) = ui.ctx().pointer_interact_pos() {
-        pos.y >= track_top && pos.y <= track_bottom
-    } else {
-        false
-    }
-} 

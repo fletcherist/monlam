@@ -1,5 +1,5 @@
 use crate::group::Group;
-use crate::ui::main::{SAMPLE_BORDER_COLOR, TRACK_HEIGHT, TRACK_TEXT_COLOR, WAVEFORM_COLOR};
+use crate::ui::main::{SAMPLE_BORDER_COLOR, TRACK_TEXT_COLOR, WAVEFORM_COLOR};
 use eframe::egui;
 use std::path::{Path, PathBuf};
 
@@ -8,7 +8,6 @@ use std::path::{Path, PathBuf};
 pub struct GroupPanel {
     groups: Vec<Group>,
     current_folder: PathBuf,
-    show_panel: bool,
     selected_group_idx: Option<usize>,
     renaming_group_idx: Option<usize>,
     new_name_buffer: String,
@@ -29,7 +28,6 @@ impl GroupPanel {
         Self {
             groups,
             current_folder,
-            show_panel: true,
             selected_group_idx: None,
             renaming_group_idx: None,
             new_name_buffer: String::new(),
@@ -307,14 +305,8 @@ impl GroupPanel {
         
         dragged
     }
-    
-    pub fn set_show_panel(&mut self, show: bool) {
-        self.show_panel = show;
-    }
-    
-    pub fn get_show_panel(&self) -> bool {
-        self.show_panel
-    }
+
+
     
     /// Check if the given path matches the current folder
     pub fn is_current_folder(&self, path: &Path) -> bool {

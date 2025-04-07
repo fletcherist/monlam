@@ -1,5 +1,5 @@
 use crate::daw::SelectionRect;
-use crate::ui::main::{GROUP_COLOR, SAMPLE_BORDER_COLOR, TRACK_HEIGHT, TRACK_TEXT_COLOR, WAVEFORM_COLOR};
+use crate::ui::main::{GROUP_COLOR, TRACK_HEIGHT, TRACK_TEXT_COLOR};
 use crate::daw::TrackItemType;
 use egui::{Color32, Stroke};
 

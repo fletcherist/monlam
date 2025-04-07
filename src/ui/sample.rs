@@ -15,7 +15,6 @@ pub fn draw_sample(
     position: f32,
     length: f32,
     waveform: &Vec<f32>,
-    sample_rate: u32,
     duration: f32,
     audio_start_time: f32,
     audio_end_time: f32,

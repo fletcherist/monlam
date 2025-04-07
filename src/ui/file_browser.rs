@@ -117,7 +117,6 @@ impl FileBrowserPanel {
                 let is_dir = path.is_dir();
                 let icon = if is_dir { "📁" } else if *is_audio { "🔊" } else { "📄" };
                 
-                let id = ui.make_persistent_id(format!("file_{}", i));
                 let response = ui.horizontal(|ui| {
                     ui.label(format!("{} {}", icon, name));
                 }).response;
@@ -169,10 +168,7 @@ impl FileBrowserPanel {
         
         file_dragged
     }
-    
-    pub fn set_show_panel(&mut self, show: bool) {
-        self.show_panel = show;
-    }
+
     
     pub fn get_show_panel(&self) -> bool {
         self.show_panel

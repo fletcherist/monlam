@@ -265,7 +265,7 @@ impl<'a> TrackControls<'a> {
                         egui::DragValue::new(&mut start)
                             .speed(0.1)
                             .suffix(" s")
-                            .clamp_range(0.0..=*duration),
+                            .range(0.0..=*duration),
                     );
 
                     ui.add_space(8.0);
@@ -676,7 +676,7 @@ impl eframe::App for DawApp {
         }
 
         // Define UI actions without capturing self
-        #[derive(Clone)]
+        #[allow(dead_code)]
         enum UiAction {
             Rewind,
             TogglePlayback,

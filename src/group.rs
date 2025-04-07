@@ -1,8 +1,7 @@
-use crate::audio::{self, load_audio, AudioError};
+use crate::audio::load_audio;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
 
 /// A Group is a container for audio content that can be saved and reused in projects.
 /// Each Group is stored as a folder in the project directory.
@@ -190,11 +189,6 @@ impl Group {
         self.render_path = self.path.join("render.wav");
         
         Ok(())
-    }
-    
-    /// Check if this Group has a valid render file
-    pub fn has_render(&self) -> bool {
-        self.render_path.exists()
     }
 }
 

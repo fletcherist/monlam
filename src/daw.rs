@@ -32,8 +32,6 @@ pub enum DawAction {
     SetGridDivision(f32),
     RewindTimeline,
     ForwardTimeline(f32),
-    SetTrackPosition(usize, f32),
-    SetTrackLength(usize, f32),
     ToggleTrackMute(usize),
     ToggleTrackSolo(usize),
     ToggleTrackRecord(usize),
@@ -49,7 +47,6 @@ pub enum DawAction {
     RenderSelection(PathBuf),  // Path to save the rendered WAV file
     SetZoomLevel(f32),         // Set the zoom level for the grid
     SetLoopRangeFromSelection, // Set loop range from current selection without toggling loop state
-    SetLoopRange(f32, f32),    // Set loop start and end times in seconds
     CreateGroup(String),       // Create a new Group with the given name
     RenameGroup(String, String), // Rename a Group (old_name, new_name)
     DeleteGroup(String),       // Delete a Group by name
@@ -61,7 +58,6 @@ pub enum DawAction {
     SaveGroup(String),         // Save current Group state and update render.wav
 }
 
-const BUFFER_SIZE: usize = 1024;
 const SAMPLE_RATE: u32 = 44100;
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -494,41 +490,6 @@ impl Sample {
         self.seek_to(0.0);
         self.current_position = 0.0;
     }
-
-    // Add method to set trim points
-    pub fn set_trim_points(&mut self, start: f32, end: f32) {
-        if let Some(waveform) = &self.waveform {
-            // Ensure trim points are within valid range
-            let valid_start = start.max(0.0).min(waveform.duration);
-            let valid_end = if end <= 0.0 {
-                waveform.duration
-            } else {
-                end.max(valid_start).min(waveform.duration)
-            };
-
-            self.trim_start = valid_start;
-            self.trim_end = valid_end;
-
-            // Recalculate grid length based on trimmed duration
-            let effective_duration = self.trim_end - self.trim_start;
-            // Use a default BPM of 120 for calculations
-            let beats_per_second = 120.0 / 60.0;
-            self.grid_length = effective_duration * beats_per_second * 0.5;
-
-            // Reset playback position
-            self.current_position = 0.0;
-            let index = (self.trim_start * waveform.sample_rate as f32) as usize;
-            self.sample_index.store(index, Ordering::Relaxed);
-
-            eprintln!(
-                "Set trim points: start={:.2}s, end={:.2}s, effective duration={:.2}s, new grid_length={:.2}",
-                self.trim_start,
-                self.trim_end,
-                effective_duration,
-                self.grid_length
-            );
-        }
-    }
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -555,27 +516,6 @@ impl Default for Track {
 }
 
 impl Track {
-    // Find overlapping samples - This is already implemented correctly
-    pub fn find_overlapping_samples(&self) -> Vec<(usize, usize)> {
-        let mut overlaps = Vec::new();
-
-        for i in 0..self.samples.len() {
-            for j in i + 1..self.samples.len() {
-                let sample1 = &self.samples[i];
-                let sample2 = &self.samples[j];
-
-                // Check if the samples overlap
-                if sample1.grid_position < sample2.grid_position + sample2.grid_length
-                    && sample2.grid_position < sample1.grid_position + sample1.grid_length
-                {
-                    overlaps.push((sample1.id, sample2.id));
-                }
-            }
-        }
-
-        overlaps
-    }
-
     // Add a sample to the track
     pub fn add_sample(&mut self, mut sample: Sample) {
         // Generate a unique ID for the sample
@@ -644,7 +584,6 @@ pub struct DawState {
     pub tracks: Vec<Track>,
     pub grid_division: f32,
     #[serde(skip)]
-    pub drag_offset: Option<f32>,
     pub last_clicked_bar: f32,
     pub project_name: String,
     pub file_path: Option<PathBuf>,
@@ -697,7 +636,6 @@ impl Default for DawState {
                 })
                 .collect(),
             grid_division: 0.25,
-            drag_offset: None,
             last_clicked_bar: 0.0,
             project_name: String::new(),
             file_path: None,
@@ -1172,26 +1110,6 @@ impl DawApp {
                     }
                 }
             }
-            DawAction::SetTrackPosition(track_id, new_position) => {
-                if let Some(track) = self.state.tracks.iter_mut().find(|t| t.id == track_id) {
-                    // In the new structure, we need to move all samples in the track
-                    for sample in &mut track.samples {
-                        sample.grid_position =
-                            new_position + (sample.grid_position - sample.grid_position); // Maintain relative positions
-                        sample.update_grid_times(self.state.bpm);
-                    }
-                }
-            }
-            DawAction::SetTrackLength(track_id, new_length) => {
-                // This doesn't make sense for tracks anymore as they don't have a fixed length
-                // Instead we'll interpret this as scaling all samples in the track
-                if let Some(track) = self.state.tracks.iter_mut().find(|t| t.id == track_id) {
-                    for sample in &mut track.samples {
-                        sample.grid_length = new_length; // This is simplified; in reality you'd want a more complex scaling approach
-                        sample.update_grid_times(self.state.bpm);
-                    }
-                }
-            }
             DawAction::ToggleTrackMute(track_id) => {
                 if let Some(track) = self.state.tracks.iter_mut().find(|t| t.id == track_id) {
                     track.muted = !track.muted;
@@ -1221,9 +1139,8 @@ impl DawApp {
                     // Try to load the audio file first
                     if let Some(path_ref) = &sample.audio_file {
                         match load_audio(path_ref) {
-                            Ok((samples, sample_rate)) => {
+                            Ok((samples, _sample_rate)) => {
                                 // Only initialize the sample if loading succeeded
-                                let duration: f32 = samples.len() as f32 / sample_rate as f32;
                                 sample.total_frames = samples.len();
 
                                 // Load samples into the audio buffer
@@ -1521,13 +1438,6 @@ impl DawApp {
                     self.state.loop_range = Some((start_time, end_time));
                 }
             }
-            DawAction::SetLoopRange(start, end) => {
-                if start < end {
-                    self.state.loop_range = Some((start, end));
-                    // Enable looping if we're setting a loop range
-                    self.state.loop_enabled = true;
-                }
-            }
             DawAction::CreateGroup(name) => {
                 // Implementation of creating a new Group
                 if let Some(project_path) = self.state.file_path.as_ref() {
@@ -1667,80 +1577,6 @@ impl DawApp {
                                     }
                                 }
                             }
-                        }
-                    }
-                }
-            }
-            DawAction::AddGroupToTrack(track_id, box_name) => {
-                // Implementation of adding an AudioBox to a track
-                if let Some(project_path) = self.state.file_path.as_ref() {
-                    if let Some(project_dir) = project_path.parent() {
-                        let box_path = project_dir.join(&box_name);
-                        if box_path.exists() && box_path.is_dir() {
-                            let render_path = box_path.join("render.wav");
-                            if render_path.exists() {
-                                // Add the AudioBox's rendered audio as a sample to the track
-                                if let Some(track) = self.state.tracks.iter_mut().find(|t| t.id == track_id) {
-                                    let mut sample = Sample::default();
-                                    sample.audio_file = Some(render_path.clone());
-                                    sample.name = box_name.clone();
-                                    sample.item_type = TrackItemType::Group; // Mark this sample as a group
-
-                                    // Try to load the audio file first
-                                    if let Some(path) = &sample.audio_file {
-                                        match load_audio(path) {
-                                            Ok((samples, sample_rate)) => {
-                                                // Calculate duration
-                                                let duration = samples.len() as f32 / sample_rate as f32;
-                                                
-                                                // Initialize AudioBuffer
-                                                let buffer = Arc::new(Mutex::new(samples));
-                                                sample.audio_buffer = buffer;
-                                                
-                                                // Initialize sample index
-                                                sample.sample_index = Arc::new(AtomicUsize::new(0));
-                                                
-                                                // Calculate grid length based on duration
-                                                sample.grid_length = duration * (self.state.bpm / 60.0);
-                                                sample.update_grid_times(self.state.bpm);
-                                                
-                                                // Get a unique ID
-                                                sample.id = track.samples.len(); // Use length as new ID
-                                                
-                                                // Set the cursor position to the timeline position
-                                                sample.grid_position = self.state.last_clicked_bar;
-                                                sample.update_grid_times(self.state.bpm);
-                                                
-                                                // Create audio stream
-                                                sample.create_stream(&self.audio);
-                                                
-                                                // Generate downsampled waveform for display
-                                                {
-                                                    let buffer_guard = sample.audio_buffer.lock().unwrap();
-                                                    
-                                                    // Generate a smaller waveform for display
-                                                    sample.waveform = Some(SampleWaveform {
-                                                        samples: generate_waveform(&buffer_guard, 1000),
-                                                        sample_rate,
-                                                        duration,
-                                                    });
-                                                } // buffer_guard is dropped here
-                                                
-                                                // Add sample to track
-                                                track.samples.push(sample);
-                                                eprintln!("Added AudioBox {} to track {}", box_name, track_id);
-                                            }
-                                            Err(e) => {
-                                                eprintln!("Error loading audio: {:?}", e);
-                                            }
-                                        }
-                                    }
-                                }
-                            } else {
-                                eprintln!("AudioBox does not have a rendered audio file");
-                            }
-                        } else {
-                            eprintln!("AudioBox not found: {}", box_name);
                         }
                     }
                 }
@@ -2448,7 +2284,6 @@ impl DawApp {
                 is_playing: false,
                 bpm,
                 grid_division: 0.25,
-                drag_offset: None,
                 last_clicked_bar: 0.0,
                 project_name: "Test Project".to_string(),
                 file_path: None,
@@ -2513,13 +2348,6 @@ impl DawApp {
         let target_sample_rate = 44100;
         let num_channels = 2; // Stereo output
 
-        // Size of each processing buffer (similar to real-time audio processing)
-        const BUFFER_SIZE: usize = 1024;
-
-        // Calculate total number of frames and buffers
-        let total_frames = (duration * target_sample_rate as f32) as usize;
-        let num_buffers = (total_frames + BUFFER_SIZE - 1) / BUFFER_SIZE;
-
         // Create the WAV file with appropriate specs
         use hound::{WavSpec, WavWriter};
         let spec = WavSpec {
@@ -2529,7 +2357,7 @@ impl DawApp {
             sample_format: hound::SampleFormat::Int,
         };
 
-        let mut writer = match WavWriter::create(output_path, spec) {
+        let writer = match WavWriter::create(output_path, spec) {
             Ok(writer) => writer,
             Err(e) => {
                 eprintln!("Failed to create WAV file: {}", e);
